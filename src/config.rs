@@ -310,11 +310,10 @@ impl History {
         if let Ok(raw) = std::fs::read_to_string(Self::path()) {
             for line in raw.lines() {
                 // Split at the last tab so paths may contain tabs themselves.
-                if let Some((path, page)) = line.rsplit_once('\t') {
-                    if let Ok(page) = page.trim().parse::<usize>() {
+                if let Some((path, page)) = line.rsplit_once('\t')
+                    && let Ok(page) = page.trim().parse::<usize>() {
                         entries.push((PathBuf::from(path), page));
                     }
-                }
             }
         }
         Self { entries }

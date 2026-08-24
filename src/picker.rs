@@ -248,24 +248,22 @@ impl Component for PickerDialog {
                 rebuild_list(&widgets.results_list, &self.results);
             }
             PickerMsg::Confirm(index) => {
-                if !self.done {
-                    if let Some(path) = self.results.get(index) {
+                if !self.done
+                    && let Some(path) = self.results.get(index) {
                         self.done = true;
                         let _ = sender.output(PickerOutput::Pick(PathBuf::from(path)));
                         root.close();
                     }
-                }
             }
             PickerMsg::ConfirmCurrent => {
                 if let Some(row) = widgets.results_list.selected_row() {
                     let index = row.index().max(0) as usize;
-                    if !self.done {
-                        if let Some(path) = self.results.get(index) {
+                    if !self.done
+                        && let Some(path) = self.results.get(index) {
                             self.done = true;
                             let _ = sender.output(PickerOutput::Pick(PathBuf::from(path)));
                             root.close();
                         }
-                    }
                 }
             }
             PickerMsg::Closed => {
@@ -346,13 +344,12 @@ fn move_selection(
     };
     match current {
         None => {
-            if delta > 0 {
-                if let Some(row) = list.row_at_index(0) {
+            if delta > 0
+                && let Some(row) = list.row_at_index(0) {
                     list.select_row(Some(&row));
                     row.grab_focus();
                     scroll_row_into_view(scroller, list, &row);
                 }
-            }
         }
         Some(index) => {
             let target = index as isize + delta;

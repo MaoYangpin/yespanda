@@ -33,17 +33,15 @@ fn chord_press(
     keyval: gdk::Key,
     now: std::time::Instant,
 ) -> Option<AppMsg> {
-    if let Some((armed, pressed)) = *leader {
-        if now.duration_since(pressed) <= CHORD_WINDOW {
-            if let Some((_, _, msg)) = chords
+    if let Some((armed, pressed)) = *leader
+        && now.duration_since(pressed) <= CHORD_WINDOW
+            && let Some((_, _, msg)) = chords
                 .iter()
                 .find(|(leader_key, chord_key, _)| *leader_key == armed && *chord_key == keyval)
             {
                 *leader = None;
                 return Some(msg.clone());
             }
-        }
-    }
     if chords.iter().any(|(leader_key, _, _)| *leader_key == keyval) {
         *leader = Some((keyval, now));
     } else {
@@ -605,8 +603,8 @@ impl Component for AppModel {
         .into_iter()
         .filter_map(|(spec, msg)| {
             let mut tokens = spec.split_whitespace();
-            let leader = tokens.next().and_then(|token| gdk::Key::from_name(token))?;
-            let key = tokens.next().and_then(|token| gdk::Key::from_name(token))?;
+            let leader = tokens.next().and_then(gdk::Key::from_name)?;
+            let key = tokens.next().and_then(gdk::Key::from_name)?;
             Some((leader, key, msg))
         })
         .collect();

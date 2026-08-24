@@ -85,7 +85,7 @@ impl Component for TocSidebar {
                     // entry index (collapsed subtrees shift positions), which
                     // needs the model, so route it through an input message.
                     let position = row.index().max(0) as usize;
-                    let _ = sender.input(TocInput::OpenAt(position));
+                    sender.input(TocInput::OpenAt(position));
                 },
             },
         }
@@ -112,30 +112,26 @@ impl Component for TocSidebar {
             let input = sender.clone();
             let b = bindings;
             key_controller.connect_key_pressed(move |_, keyval, _, state| {
-                if let Some((modifiers, key)) = b.down {
-                    if state == modifiers && keyval == key {
+                if let Some((modifiers, key)) = b.down
+                    && state == modifiers && keyval == key {
                         input.input(TocInput::MoveCursor(1));
                         return glib::Propagation::Stop;
                     }
-                }
-                if let Some((modifiers, key)) = b.up {
-                    if state == modifiers && keyval == key {
+                if let Some((modifiers, key)) = b.up
+                    && state == modifiers && keyval == key {
                         input.input(TocInput::MoveCursor(-1));
                         return glib::Propagation::Stop;
                     }
-                }
-                if let Some((modifiers, key)) = b.activate {
-                    if state == modifiers && keyval == key {
+                if let Some((modifiers, key)) = b.activate
+                    && state == modifiers && keyval == key {
                         input.input(TocInput::Activate);
                         return glib::Propagation::Stop;
                     }
-                }
-                if let Some((modifiers, key)) = b.collapse {
-                    if state == modifiers && keyval == key {
+                if let Some((modifiers, key)) = b.collapse
+                    && state == modifiers && keyval == key {
                         input.input(TocInput::Collapse);
                         return glib::Propagation::Stop;
                     }
-                }
                 glib::Propagation::Proceed
             });
         }
@@ -215,8 +211,8 @@ impl Component for TocSidebar {
                 }
             }
             TocInput::Collapse => {
-                if let Some(entry_index) = self.current_entry(&widgets.toc_list) {
-                    if has_children(&self.entries, entry_index) && !self.collapsed[entry_index] {
+                if let Some(entry_index) = self.current_entry(&widgets.toc_list)
+                    && has_children(&self.entries, entry_index) && !self.collapsed[entry_index] {
                         self.collapsed[entry_index] = true;
                         rebuild(&widgets.toc_list, &self.entries, &self.collapsed, &mut self.rows);
                         if let Some(position) = self
@@ -227,7 +223,6 @@ impl Component for TocSidebar {
                             self.select_row(&widgets.toc_list, position);
                         }
                     }
-                }
             }
             TocInput::OpenAt(position) => {
                 if let Some((_, entry_index)) = self.rows.get(position) {
