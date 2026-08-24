@@ -139,6 +139,19 @@ impl PdfDoc {
     }
 
     pub fn render_page(&self, index: usize, zoom: f64) -> Result<gdk::MemoryTexture> {
+        let (width, height, packed) = self.render_page_bytes(index, zoom)?;
+        Ok(gdk::MemoryTexture::new(
+            width,
+            height,
+            gdk::MemoryFormat::B8g8r8a8Premultiplied,
+            &glib::Bytes::from_owned(packed),
+            width as usize * 4,
+        ))
+    }
+
+    /// Render a page to packed BGRA bytes `(width, height, data)`. Uses only
+    /// cairo (no GDK objects), so it is safe to call off the main thread.
+    pub fn render_page_bytes(&self, index: usize, zoom: f64) -> Result<(i32, i32, Vec<u8>)> {
         let page = self.doc.page(index as i32).context("missing page")?;
         let (width_pt, height_pt) = page.size();
 
@@ -172,13 +185,7 @@ impl PdfDoc {
             }
         };
 
-        Ok(gdk::MemoryTexture::new(
-            width,
-            height,
-            gdk::MemoryFormat::B8g8r8a8Premultiplied,
-            &glib::Bytes::from_owned(packed),
-            row_len,
-        ))
+        Ok((width, height, packed))
     }
 }
 

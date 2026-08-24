@@ -8,7 +8,7 @@ name = "yespanda"
 path = "src/main.rs"
 
 [dependencies]
-adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5", "v1_6"] }
 relm4 = { version = "0.11", features = ["libadwaita"] }
 poppler-rs = { version = "0.26", features = ["v22_2"] }
 cairo-rs = "0.22"

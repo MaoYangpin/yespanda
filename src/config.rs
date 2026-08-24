@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use relm4::gtk::gdk;
@@ -58,6 +58,40 @@ pub struct Config {
     pub theme: ThemePreference,
     #[serde(default)]
     pub keymap: KeymapConfig,
+    #[serde(default)]
+    pub picker: PickerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PickerConfig {
+    /// Directory `fd` searches for PDFs. A leading `~/` expands to the home
+    /// directory; empty means `$HOME`.
+    #[serde(default)]
+    pub root: String,
+    /// Width of the picker dialog in pixels.
+    #[serde(default = "picker_default_width")]
+    pub width: i32,
+    /// Height of the picker dialog in pixels.
+    #[serde(default = "picker_default_height")]
+    pub height: i32,
+}
+
+fn picker_default_width() -> i32 {
+    720
+}
+
+fn picker_default_height() -> i32 {
+    520
+}
+
+impl Default for PickerConfig {
+    fn default() -> Self {
+        Self {
+            root: "~".into(),
+            width: picker_default_width(),
+            height: picker_default_height(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +164,13 @@ pub struct KeymapConfig {
     pub zoom_in: String,
     #[serde(default = "key_default_zoom_out")]
     pub zoom_out: String,
+    /// Open the fd+fzf PDF picker dialog.
+    #[serde(default = "key_default_pick_file")]
+    pub pick_file: String,
+    /// Alternative picker binding as a two-key chord (`space space`, LazyVim
+    /// style). Both it and `pick_file` open the picker.
+    #[serde(default = "key_default_pick_file_chord")]
+    pub pick_file_chord: String,
 }
 
 macro_rules! key_default {
@@ -153,6 +194,8 @@ key_default!(key_default_focus_sidebar, "ctrl h");
 key_default!(key_default_focus_pdf, "ctrl l");
 key_default!(key_default_zoom_in, "ctrl plus");
 key_default!(key_default_zoom_out, "ctrl minus");
+key_default!(key_default_pick_file, "ctrl o");
+key_default!(key_default_pick_file_chord, "space space");
 
 impl Default for KeymapConfig {
     fn default() -> Self {
@@ -170,6 +213,8 @@ impl Default for KeymapConfig {
             focus_pdf: "ctrl l".into(),
             zoom_in: "ctrl plus".into(),
             zoom_out: "ctrl minus".into(),
+            pick_file: "ctrl o".into(),
+            pick_file_chord: "space space".into(),
         }
     }
 }
@@ -192,6 +237,7 @@ impl Default for Config {
             fit_width: true,
             theme: ThemePreference::System,
             keymap: KeymapConfig::default(),
+            picker: PickerConfig::default(),
         }
     }
 }
@@ -239,6 +285,74 @@ impl From<ThemePreference> for adw::ColorScheme {
     }
 }
 
+/// Recently opened documents with their last-viewed page, persisted to
+/// `~/.cache/yespanda/history`. Most recent entry first.
+#[derive(Debug, Clone, Default)]
+pub struct History {
+    entries: Vec<(PathBuf, usize)>,
+}
+
+const HISTORY_MAX: usize = 50;
+
+impl History {
+    /// Path of the history file, honouring the XDG cache base directory spec.
+    pub fn path() -> PathBuf {
+        let home = || std::env::var_os("HOME").unwrap_or_default();
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(home()).join(".cache"))
+            .join("yespanda")
+            .join("history")
+    }
+
+    pub fn load() -> Self {
+        let mut entries = Vec::new();
+        if let Ok(raw) = std::fs::read_to_string(Self::path()) {
+            for line in raw.lines() {
+                // Split at the last tab so paths may contain tabs themselves.
+                if let Some((path, page)) = line.rsplit_once('\t') {
+                    if let Ok(page) = page.trim().parse::<usize>() {
+                        entries.push((PathBuf::from(path), page));
+                    }
+                }
+            }
+        }
+        Self { entries }
+    }
+
+    /// The last-viewed page for `path`, if any.
+    pub fn page_for(&self, path: &Path) -> Option<usize> {
+        self.entries
+            .iter()
+            .find(|(entry, _)| entry == path)
+            .map(|(_, page)| *page)
+    }
+
+    /// Record the position for `path`, moving it to the front.
+    pub fn set(&mut self, path: &Path, page: usize) {
+        self.entries.retain(|(entry, _)| entry != path);
+        self.entries.insert(0, (path.to_path_buf(), page));
+        self.entries.truncate(HISTORY_MAX);
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut raw = String::new();
+        for (entry, page) in &self.entries {
+            raw.push_str(&entry.display().to_string());
+            raw.push('\t');
+            raw.push_str(&page.to_string());
+            raw.push('\n');
+        }
+        std::fs::write(&path, raw)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +390,29 @@ mod tests {
         );
         assert_eq!(parse_binding("bogus_key"), None);
         assert_eq!(parse_binding(""), None);
+    }
+
+    #[test]
+    fn history_roundtrip() {
+        let cache = std::env::temp_dir().join("yespanda-history-test");
+        // SAFETY: test-only, single-threaded (--test-threads=1).
+        unsafe { std::env::set_var("XDG_CACHE_HOME", &cache) };
+
+        let real = Path::new("/tmp/opencode/real.pdf");
+        let other = Path::new("/tmp/opencode/test.pdf");
+
+        let mut history = History::default();
+        assert_eq!(history.page_for(real), None);
+        history.set(real, 42);
+        history.set(other, 7);
+        history.set(real, 10); // re-open real.pdf: moves to front, updates page
+        assert!(history.save().is_ok());
+
+        let loaded = History::load();
+        assert_eq!(loaded.page_for(real), Some(10));
+        assert_eq!(loaded.page_for(other), Some(7));
+        assert_eq!(loaded.entries[0].0, real);
+
+        let _ = std::fs::remove_dir_all(&cache);
     }
 }

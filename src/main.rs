@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod pdf;
+mod picker;
 mod toc;
 
 use relm4::gtk::glib;
