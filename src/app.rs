@@ -195,10 +195,18 @@ impl AppModel {
         self.toc.sender().send(TocInput::Highlight(target)).ok();
     }
 
-    /// Sidebar entry covering `page`: the last one starting at or before it.
+    /// Sidebar entry covering `page`: the entry whose page is the greatest
+    /// one at or before it. Outline order is not page-sorted (a later chapter
+    /// can start on an earlier page), so a linear scan is required instead of
+    /// a binary search; on ties the last occurrence wins, which is the most
+    /// specific section.
     fn active_toc_entry(&self, page: usize) -> Option<usize> {
-        let index = self.toc_entries.partition_point(|entry| entry.page <= page);
-        index.checked_sub(1)
+        self.toc_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.page <= page)
+            .max_by_key(|(_, entry)| entry.page)
+            .map(|(index, _)| index)
     }
 
     fn scroll_to_page(&mut self, page: usize) {
