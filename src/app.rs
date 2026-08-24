@@ -7,15 +7,14 @@ use adw::prelude::*;
 use relm4::gtk::glib;
 use relm4::gtk::glib::clone;
 use relm4::gtk::gdk;
-use relm4::gtk::gio::{SimpleAction, SimpleActionGroup};
 use relm4::{
     Component, ComponentController, ComponentParts, ComponentSender, Controller,
     RelmRemoveAllExt, adw, gtk,
 };
 
-use crate::config::Config;
+use crate::config::{Config, parse_binding};
 use crate::pdf::{PdfDoc, TocEntry};
-use crate::toc::{TocInput, TocOutput, TocSidebar};
+use crate::toc::{SidebarBindings, TocInput, TocOutput, TocSidebar};
 
 const PAGE_SPACING: i32 = 12;
 /// Portion of the viewport scrolled by one `j`/`k` press.
@@ -54,6 +53,11 @@ pub enum AppMsg {
     ScrollLeft,
     ScrollRight,
     ToggleSidebar,
+    /// Move keyboard focus to the TOC sidebar (Ctrl+h). Never scrolls the
+    /// PDF or changes the position highlight.
+    FocusSidebar,
+    /// Move keyboard focus to the PDF content (Ctrl+l).
+    FocusPdf,
 }
 
 impl AppModel {
@@ -341,8 +345,15 @@ impl Component for AppModel {
     ) -> ComponentParts<Self> {
         let config = Rc::new(RefCell::new(init));
 
+        let keymap = config.borrow().keymap.clone();
+        let sidebar_bindings = SidebarBindings {
+            down: parse_binding(&keymap.sidebar_down),
+            up: parse_binding(&keymap.sidebar_up),
+            activate: parse_binding(&keymap.sidebar_activate),
+            collapse: parse_binding(&keymap.sidebar_collapse),
+        };
         let toc = TocSidebar::builder()
-            .launch(())
+            .launch(sidebar_bindings)
             .forward(sender.input_sender(), |msg| match msg {
                 TocOutput::GoTo(index) => AppMsg::GoToEntry(index),
             });
@@ -450,29 +461,24 @@ impl Component for AppModel {
             }),
         );
 
-        let actions = SimpleActionGroup::new();
-        for (name, msg, accels) in [
-            ("zoom-in", AppMsg::ZoomIn, &["<Primary>plus", "<Primary>equal"][..]),
-            ("zoom-out", AppMsg::ZoomOut, &["<Primary>minus"][..]),
-        ] {
-            let action = SimpleAction::new(name, None);
-            let forward = sender.clone();
-            action.connect_activate(move |_, _| forward.input(msg.clone()));
-            actions.add_action(&action);
-            if let Some(application) = root.application() {
-                application.set_accels_for_action(&format!("win.{name}"), accels);
-            }
-        }
-        root.insert_action_group("win", Some(&actions));
-
-        // Vim-style navigation and the sidebar chord are handled by a key
-        // controller: GTK4 does not activate accelerators for bare (unmodified)
-        // character keys like "j", so they would never fire as accels.
+        // All bindings live in `[keymap]` and are handled by a key controller:
+        // GTK4 does not activate accelerators for bare (unmodified) character
+        // keys like "j", so they would never fire as accels.
         let keymap = config.borrow().keymap.clone();
-        let scroll_down = gdk::Key::from_name(&keymap.scroll_down);
-        let scroll_up = gdk::Key::from_name(&keymap.scroll_up);
-        let scroll_left = gdk::Key::from_name(&keymap.scroll_left);
-        let scroll_right = gdk::Key::from_name(&keymap.scroll_right);
+        let bindings: Vec<(AppMsg, gdk::ModifierType, gdk::Key)> = [
+            (AppMsg::ScrollDown, &keymap.scroll_down),
+            (AppMsg::ScrollUp, &keymap.scroll_up),
+            (AppMsg::ScrollLeft, &keymap.scroll_left),
+            (AppMsg::ScrollRight, &keymap.scroll_right),
+            (AppMsg::FocusSidebar, &keymap.focus_sidebar),
+            (AppMsg::FocusPdf, &keymap.focus_pdf),
+            (AppMsg::ZoomIn, &keymap.zoom_in),
+            (AppMsg::ZoomOut, &keymap.zoom_out),
+        ]
+        .into_iter()
+        .filter_map(|(msg, spec)| parse_binding(spec).map(|(mods, key)| (msg, mods, key)))
+        .collect();
+
         let chord = {
             let mut tokens = keymap.sidebar_toggle.split_whitespace();
             let leader = tokens.next().and_then(|token| gdk::Key::from_name(token));
@@ -485,7 +491,7 @@ impl Component for AppModel {
             let leader = leader.clone();
             let forward = sender.clone();
             const CHORD_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
-            key_controller.connect_key_pressed(move |_, keyval, _, _| {
+            key_controller.connect_key_pressed(move |_, keyval, _, state| {
                 let now = std::time::Instant::now();
                 if Some(keyval) == chord.0 {
                     leader.set(Some(now));
@@ -501,21 +507,11 @@ impl Component for AppModel {
                     }
                 }
                 leader.set(None);
-                if Some(keyval) == scroll_down {
-                    forward.input(AppMsg::ScrollDown);
-                    return glib::Propagation::Stop;
-                }
-                if Some(keyval) == scroll_up {
-                    forward.input(AppMsg::ScrollUp);
-                    return glib::Propagation::Stop;
-                }
-                if Some(keyval) == scroll_left {
-                    forward.input(AppMsg::ScrollLeft);
-                    return glib::Propagation::Stop;
-                }
-                if Some(keyval) == scroll_right {
-                    forward.input(AppMsg::ScrollRight);
-                    return glib::Propagation::Stop;
+                for (msg, modifiers, key) in &bindings {
+                    if state == *modifiers && keyval == *key {
+                        forward.input(msg.clone());
+                        return glib::Propagation::Stop;
+                    }
                 }
                 glib::Propagation::Proceed
             });
@@ -581,6 +577,9 @@ impl Component for AppModel {
                     self.highlighted_toc = Some(index);
                     self.toc.sender().send(TocInput::Highlight(Some(index))).ok();
                     self.scroll_to_page(entry.page);
+                    // Returning focus to the content lets j/k/h/l scroll the
+                    // PDF again after opening an entry with `l` or a click.
+                    self.pages_scroller.grab_focus();
                 }
             }
             AppMsg::ViewportChanged => {
@@ -603,6 +602,20 @@ impl Component for AppModel {
                 widgets.split_view.set_collapsed(collapsed);
                 self.config.borrow_mut().sidebar.collapsed = collapsed;
                 self.persist_config();
+            }
+            AppMsg::FocusSidebar => {
+                // Focus the sidebar on the item for the currently visible
+                // page. `highlighted_toc` tracks exactly that: the clicked
+                // entry after a click, else the section covering the page.
+                // Front-matter before the first TOC entry anchors on the
+                // first entry. No PDF scrolling or highlight change happens.
+                let entry = self
+                    .highlighted_toc
+                    .or_else(|| (!self.toc_entries.is_empty()).then_some(0));
+                self.toc.sender().send(TocInput::Focus(entry)).ok();
+            }
+            AppMsg::FocusPdf => {
+                self.pages_scroller.grab_focus();
             }
         }
         self.update_view(widgets, sender);
