@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use relm4::gtk::glib;
@@ -11,6 +13,7 @@ use relm4::{
     RelmRemoveAllExt, adw, gtk,
 };
 
+use crate::config::Config;
 use crate::pdf::{PdfDoc, TocEntry};
 use crate::toc::{TocInput, TocOutput, TocSidebar};
 
@@ -30,6 +33,7 @@ pub struct AppModel {
     status_page: adw::StatusPage,
     toc_entries: Vec<TocEntry>,
     highlighted_toc: Option<usize>,
+    config: Rc<RefCell<Config>>,
     toc: Controller<TocSidebar>,
 }
 
@@ -49,14 +53,18 @@ impl AppModel {
         let sizes_pt: Vec<(f64, f64)> = (0..n_pages).map(|i| doc.page_size(i)).collect();
 
         self.doc = Some(doc);
-        self.path = Some(path);
+        self.path = Some(path.clone());
         self.zoom = 1.0;
-        self.fit_mode = true;
         self.last_viewport_width = 0;
         self.page_sizes_pt = sizes_pt;
         self.toc_entries = entries.clone();
         self.highlighted_toc = None;
         self.rebuild_pages();
+
+        if let Some(path) = path.to_str() {
+            self.config.borrow_mut().last_file = Some(path.to_owned());
+            self.persist_config();
+        }
 
         let name = self
             .path
@@ -75,6 +83,19 @@ impl AppModel {
         widgets.title_widget.set_title("Error");
         self.status_page.set_title("Could not open document");
         self.status_page.set_description(Some(&format!("{error:#}")));
+    }
+
+    fn persist_config(&self) {
+        if let Err(error) = self.config.borrow().save() {
+            eprintln!("failed to save config: {error:#}");
+        }
+    }
+
+    /// Leave fit-to-width and remember the choice for future sessions.
+    fn set_manual_zoom(&mut self) {
+        self.fit_mode = false;
+        self.config.borrow_mut().fit_width = false;
+        self.persist_config();
     }
 
     fn rebuild_pages(&mut self) {
@@ -222,7 +243,7 @@ impl AppModel {
 
 #[relm4::component(pub)]
 impl Component for AppModel {
-    type Init = ();
+    type Init = Config;
     type Input = AppMsg;
     type Output = ();
     type CommandOutput = ();
@@ -234,7 +255,7 @@ impl Component for AppModel {
             set_default_height: 760,
 
             #[wrap(Some)]
-            set_content = &adw::NavigationSplitView {
+            set_content = split_view = &adw::NavigationSplitView {
                 set_min_sidebar_width: 180.0,
                 set_max_sidebar_width: 320.0,
                 set_sidebar_width_fraction: 0.24,
@@ -273,10 +294,12 @@ impl Component for AppModel {
     }
 
     fn init(
-        _init: Self::Init,
+        init: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        let config = Rc::new(RefCell::new(init));
+
         let toc = TocSidebar::builder()
             .launch(())
             .forward(sender.input_sender(), |msg| match msg {
@@ -304,7 +327,7 @@ impl Component for AppModel {
             doc: None,
             path: None,
             zoom: 1.0,
-            fit_mode: true,
+            fit_mode: config.borrow().fit_width,
             last_viewport_width: 0,
             page_sizes_pt: Vec::new(),
             textures: HashMap::new(),
@@ -314,10 +337,48 @@ impl Component for AppModel {
             status_page: status_page.clone(),
             toc_entries: Vec::new(),
             highlighted_toc: None,
+            config: config.clone(),
             toc,
         };
 
         let widgets = view_output!();
+
+        // Restore persisted window geometry.
+        root.set_default_size(
+            config.borrow().window.width,
+            config.borrow().window.height,
+        );
+        if config.borrow().window.maximized {
+            root.maximize();
+        }
+        widgets
+            .split_view
+            .set_sidebar_width_fraction(config.borrow().sidebar.width_fraction);
+        widgets
+            .split_view
+            .set_collapsed(config.borrow().sidebar.collapsed);
+        adw::StyleManager::default().set_color_scheme(config.borrow().theme.into());
+
+        // Persist geometry and sidebar state when the window closes.
+        {
+            let cfg = config.clone();
+            let split_view = widgets.split_view.clone();
+            root.connect_close_request(move |window| {
+                let (width, height) = window.default_size();
+                {
+                    let mut state = cfg.borrow_mut();
+                    state.window.width = width;
+                    state.window.height = height;
+                    state.window.maximized = window.is_maximized();
+                    state.sidebar.width_fraction = split_view.sidebar_width_fraction();
+                    state.sidebar.collapsed = split_view.is_collapsed();
+                }
+                if let Err(error) = cfg.borrow().save() {
+                    eprintln!("failed to save config: {error:#}");
+                }
+                glib::Propagation::Proceed
+            });
+        }
 
         widgets.content_stack.add_named(&status_page, Some("empty"));
         widgets.content_stack.add_named(&pages_scroller, Some("doc"));
@@ -356,6 +417,11 @@ impl Component for AppModel {
             application.set_accels_for_action("win.zoom-out", &["<Primary>minus"]);
         }
 
+        // Reopen the PDF viewed in the previous session.
+        if let Some(path) = config.borrow().last_file.clone() {
+            sender.input(AppMsg::OpenFile(path));
+        }
+
         ComponentParts { model, widgets }
     }
 
@@ -382,7 +448,7 @@ impl Component for AppModel {
             }
             AppMsg::ZoomIn => {
                 if self.doc.is_some() {
-                    self.fit_mode = false;
+                    self.set_manual_zoom();
                     self.zoom = (self.zoom * 1.25).min(4.0);
                     self.resize_pages();
                     self.textures.clear();
@@ -390,7 +456,7 @@ impl Component for AppModel {
             }
             AppMsg::ZoomOut => {
                 if self.doc.is_some() {
-                    self.fit_mode = false;
+                    self.set_manual_zoom();
                     self.zoom = (self.zoom / 1.25).max(0.25);
                     self.resize_pages();
                     self.textures.clear();

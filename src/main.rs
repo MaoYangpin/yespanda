@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod pdf;
 mod toc;
 
@@ -7,6 +8,7 @@ use relm4::gtk::gio::{self, prelude::{ApplicationExt, ApplicationExtManual, File
 use relm4::{MessageBroker, RelmApp};
 
 use crate::app::{AppModel, AppMsg};
+use crate::config::Config;
 
 pub const APP_ID: &str = "io.github.yespanda.Yespanda";
 
@@ -41,5 +43,5 @@ fn main() {
 
     RelmApp::from_app(app)
         .with_broker(&APP_BROKER)
-        .run::<AppModel>(());
+        .run::<AppModel>(Config::load());
 }
