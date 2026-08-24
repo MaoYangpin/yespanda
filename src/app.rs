@@ -18,6 +18,8 @@ use crate::pdf::{PdfDoc, TocEntry};
 use crate::toc::{TocInput, TocOutput, TocSidebar};
 
 const PAGE_SPACING: i32 = 12;
+/// Portion of the viewport scrolled by one `j`/`k` press.
+const SCROLL_STEP_FRACTION: f64 = 0.25;
 
 pub struct AppModel {
     doc: Option<PdfDoc>,
@@ -33,6 +35,9 @@ pub struct AppModel {
     status_page: adw::StatusPage,
     toc_entries: Vec<TocEntry>,
     highlighted_toc: Option<usize>,
+    /// Entry highlighted by a sidebar click; kept while the viewport stays
+    /// on that entry's page, otherwise replaced by scroll tracking.
+    pinned_toc: Option<usize>,
     config: Rc<RefCell<Config>>,
     toc: Controller<TocSidebar>,
 }
@@ -42,8 +47,13 @@ pub enum AppMsg {
     OpenFile(String),
     ZoomIn,
     ZoomOut,
-    GoToPage(usize),
+    GoToEntry(usize),
     ViewportChanged,
+    ScrollDown,
+    ScrollUp,
+    ScrollLeft,
+    ScrollRight,
+    ToggleSidebar,
 }
 
 impl AppModel {
@@ -59,6 +69,7 @@ impl AppModel {
         self.page_sizes_pt = sizes_pt;
         self.toc_entries = entries.clone();
         self.highlighted_toc = None;
+        self.pinned_toc = None;
         self.rebuild_pages();
 
         if let Some(path) = path.to_str() {
@@ -205,10 +216,20 @@ impl AppModel {
 
     /// Push the hover-highlight to the sidebar entry covering the visible
     /// section; only messages the sidebar when the entry actually changed.
+    /// A clicked entry stays pinned while the viewport is on its page, so
+    /// entries sharing a page (e.g. a section and a later appendix) don't
+    /// steal the highlight from the one the user chose.
     fn update_toc_highlight(&mut self) {
-        let target = self
+        if let Some(pinned) = self.pinned_toc {
+            let pinned_page = self.toc_entries.get(pinned).map(|entry| entry.page);
+            if self.current_page() != pinned_page {
+                self.pinned_toc = None;
+            }
+        }
+        let tracked = self
             .current_page()
             .and_then(|page| self.active_toc_entry(page));
+        let target = self.pinned_toc.or(tracked);
         if target == self.highlighted_toc {
             return;
         }
@@ -236,8 +257,28 @@ impl AppModel {
         }
         let offsets = self.offsets();
         let adjustment = self.pages_scroller.vadjustment();
-        let target = offsets[page];
-        adjustment.set_value(target.min(adjustment.upper() - adjustment.page_size()));
+        // Never clamp below the lower bound; a short document (content
+        // shorter than the viewport) would otherwise scroll back to the top.
+        let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        let target = offsets[page].clamp(adjustment.lower(), max);
+        adjustment.set_value(target);
+    }
+
+    /// Scroll the document vertically by `dy` (positive = down).
+    fn scroll_vertical(&self, dy: f64) {
+        let adjustment = self.pages_scroller.vadjustment();
+        let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        let value = (adjustment.value() + dy).clamp(adjustment.lower(), max);
+        adjustment.set_value(value);
+    }
+
+    /// Scroll the document horizontally by `dx` (positive = right).
+    /// A no-op while fit-width keeps the content exactly viewport-sized.
+    fn scroll_horizontal(&self, dx: f64) {
+        let adjustment = self.pages_scroller.hadjustment();
+        let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        let value = (adjustment.value() + dx).clamp(adjustment.lower(), max);
+        adjustment.set_value(value);
     }
 }
 
@@ -303,7 +344,7 @@ impl Component for AppModel {
         let toc = TocSidebar::builder()
             .launch(())
             .forward(sender.input_sender(), |msg| match msg {
-                TocOutput::GoTo(page) => AppMsg::GoToPage(page),
+                TocOutput::GoTo(index) => AppMsg::GoToEntry(index),
             });
         let toc_widget = toc.widget().clone();
 
@@ -337,6 +378,7 @@ impl Component for AppModel {
             status_page: status_page.clone(),
             toc_entries: Vec::new(),
             highlighted_toc: None,
+            pinned_toc: None,
             config: config.clone(),
             toc,
         };
@@ -354,6 +396,10 @@ impl Component for AppModel {
         widgets
             .split_view
             .set_sidebar_width_fraction(config.borrow().sidebar.width_fraction);
+        // show-content is FALSE by default, so collapsing would show the
+        // sidebar full-screen. Force content to be the visible page instead,
+        // making collapse hide the sidebar and give the content full width.
+        widgets.split_view.set_show_content(true);
         widgets
             .split_view
             .set_collapsed(config.borrow().sidebar.collapsed);
@@ -405,17 +451,76 @@ impl Component for AppModel {
         );
 
         let actions = SimpleActionGroup::new();
-        for (name, msg) in [("zoom-in", AppMsg::ZoomIn), ("zoom-out", AppMsg::ZoomOut)] {
+        for (name, msg, accels) in [
+            ("zoom-in", AppMsg::ZoomIn, &["<Primary>plus", "<Primary>equal"][..]),
+            ("zoom-out", AppMsg::ZoomOut, &["<Primary>minus"][..]),
+        ] {
             let action = SimpleAction::new(name, None);
             let forward = sender.clone();
             action.connect_activate(move |_, _| forward.input(msg.clone()));
             actions.add_action(&action);
+            if let Some(application) = root.application() {
+                application.set_accels_for_action(&format!("win.{name}"), accels);
+            }
         }
         root.insert_action_group("win", Some(&actions));
-        if let Some(application) = root.application() {
-            application.set_accels_for_action("win.zoom-in", &["<Primary>plus", "<Primary>equal"]);
-            application.set_accels_for_action("win.zoom-out", &["<Primary>minus"]);
+
+        // Vim-style navigation and the sidebar chord are handled by a key
+        // controller: GTK4 does not activate accelerators for bare (unmodified)
+        // character keys like "j", so they would never fire as accels.
+        let keymap = config.borrow().keymap.clone();
+        let scroll_down = gdk::Key::from_name(&keymap.scroll_down);
+        let scroll_up = gdk::Key::from_name(&keymap.scroll_up);
+        let scroll_left = gdk::Key::from_name(&keymap.scroll_left);
+        let scroll_right = gdk::Key::from_name(&keymap.scroll_right);
+        let chord = {
+            let mut tokens = keymap.sidebar_toggle.split_whitespace();
+            let leader = tokens.next().and_then(|token| gdk::Key::from_name(token));
+            let key = tokens.next().and_then(|token| gdk::Key::from_name(token));
+            (leader, key)
+        };
+        let leader: Rc<std::cell::Cell<Option<std::time::Instant>>> = Rc::default();
+        let key_controller = gtk::EventControllerKey::new();
+        {
+            let leader = leader.clone();
+            let forward = sender.clone();
+            const CHORD_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+            key_controller.connect_key_pressed(move |_, keyval, _, _| {
+                let now = std::time::Instant::now();
+                if Some(keyval) == chord.0 {
+                    leader.set(Some(now));
+                    return glib::Propagation::Stop;
+                }
+                if Some(keyval) == chord.1 {
+                    if let Some(pressed) = leader.get() {
+                        if now.duration_since(pressed) <= CHORD_WINDOW {
+                            leader.set(None);
+                            forward.input(AppMsg::ToggleSidebar);
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
+                leader.set(None);
+                if Some(keyval) == scroll_down {
+                    forward.input(AppMsg::ScrollDown);
+                    return glib::Propagation::Stop;
+                }
+                if Some(keyval) == scroll_up {
+                    forward.input(AppMsg::ScrollUp);
+                    return glib::Propagation::Stop;
+                }
+                if Some(keyval) == scroll_left {
+                    forward.input(AppMsg::ScrollLeft);
+                    return glib::Propagation::Stop;
+                }
+                if Some(keyval) == scroll_right {
+                    forward.input(AppMsg::ScrollRight);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
         }
+        root.add_controller(key_controller);
 
         // Reopen the PDF viewed in the previous session.
         if let Some(path) = config.borrow().last_file.clone() {
@@ -437,6 +542,14 @@ impl Component for AppModel {
                 let path = glib::filename_from_uri(&uri)
                     .map(|(path, _)| path)
                     .unwrap_or_else(|_| PathBuf::from(&uri));
+                // A file can arrive twice: once from the command line / gio
+                // open, and again from the saved `last_file` on startup.
+                // Reloading the same document mid-flight resets the zoom to
+                // 1.0 and rebuilds the pages, so page jumps computed in that
+                // window land on the wrong page. Skip the duplicate.
+                if self.doc.is_some() && self.path.as_deref() == Some(path.as_path()) {
+                    return;
+                }
                 match PdfDoc::open(&path) {
                     Ok(doc) => {
                         self.load_document(widgets, path, doc);
@@ -462,11 +575,34 @@ impl Component for AppModel {
                     self.textures.clear();
                 }
             }
-            AppMsg::GoToPage(page) => self.scroll_to_page(page),
+            AppMsg::GoToEntry(index) => {
+                if let Some(entry) = self.toc_entries.get(index) {
+                    self.pinned_toc = Some(index);
+                    self.highlighted_toc = Some(index);
+                    self.toc.sender().send(TocInput::Highlight(Some(index))).ok();
+                    self.scroll_to_page(entry.page);
+                }
+            }
             AppMsg::ViewportChanged => {
                 self.apply_fit_width();
                 self.render_visible();
                 self.update_toc_highlight();
+            }
+            AppMsg::ScrollDown => self
+                .scroll_vertical(self.pages_scroller.vadjustment().page_size() * SCROLL_STEP_FRACTION),
+            AppMsg::ScrollUp => self.scroll_vertical(
+                -self.pages_scroller.vadjustment().page_size() * SCROLL_STEP_FRACTION,
+            ),
+            AppMsg::ScrollLeft => self.scroll_horizontal(-40.0),
+            AppMsg::ScrollRight => self.scroll_horizontal(40.0),
+            AppMsg::ToggleSidebar => {
+                let collapsed = !widgets.split_view.is_collapsed();
+                // Keep the content page visible while collapsed so the sidebar
+                // is hidden instead of shown full-screen.
+                widgets.split_view.set_show_content(true);
+                widgets.split_view.set_collapsed(collapsed);
+                self.config.borrow_mut().sidebar.collapsed = collapsed;
+                self.persist_config();
             }
         }
         self.update_view(widgets, sender);

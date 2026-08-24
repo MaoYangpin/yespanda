@@ -7,13 +7,20 @@ use serde::{Deserialize, Serialize};
 /// (or `$XDG_CONFIG_HOME/yespanda/config.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub window: WindowConfig,
+    #[serde(default)]
     pub sidebar: SidebarConfig,
     /// PDF opened last session; reopened on the next launch.
+    #[serde(default)]
     pub last_file: Option<String>,
     /// Whether fit-to-width is the default viewing mode.
+    #[serde(default)]
     pub fit_width: bool,
+    #[serde(default)]
     pub theme: ThemePreference,
+    #[serde(default)]
+    pub keymap: KeymapConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,10 +30,52 @@ pub struct WindowConfig {
     pub maximized: bool,
 }
 
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            width: 1100,
+            height: 760,
+            maximized: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidebarConfig {
     pub width_fraction: f64,
     pub collapsed: bool,
+}
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self {
+            width_fraction: 0.24,
+            collapsed: false,
+        }
+    }
+}
+
+/// Vim-style key bindings. Single keys are given as a plain key name;
+/// `sidebar_toggle` is a Space-prefixed chord (`space e`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeymapConfig {
+    pub scroll_down: String,
+    pub scroll_up: String,
+    pub scroll_left: String,
+    pub scroll_right: String,
+    pub sidebar_toggle: String,
+}
+
+impl Default for KeymapConfig {
+    fn default() -> Self {
+        Self {
+            scroll_down: "j".into(),
+            scroll_up: "k".into(),
+            scroll_left: "h".into(),
+            scroll_right: "l".into(),
+            sidebar_toggle: "space e".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,18 +90,12 @@ pub enum ThemePreference {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            window: WindowConfig {
-                width: 1100,
-                height: 760,
-                maximized: false,
-            },
-            sidebar: SidebarConfig {
-                width_fraction: 0.24,
-                collapsed: false,
-            },
+            window: WindowConfig::default(),
+            sidebar: SidebarConfig::default(),
             last_file: None,
             fit_width: true,
             theme: ThemePreference::System,
+            keymap: KeymapConfig::default(),
         }
     }
 }

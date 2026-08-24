@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::OnceLock;
 
 use relm4::gtk;
@@ -23,7 +21,6 @@ fn ensure_style_loaded() {
 }
 
 pub struct TocSidebar {
-    entries: Rc<RefCell<Vec<TocEntry>>>,
     rows: Vec<gtk::ListBoxRow>,
 }
 
@@ -55,12 +52,11 @@ impl Component for TocSidebar {
             set_child = toc_list = &gtk::ListBox {
                 set_css_classes: &["navigation-sidebar"],
                 set_selection_mode: gtk::SelectionMode::Single,
-                connect_row_activated[sender, entries] => move |_list, row| {
-                    // A row's index is a TOC entry index; the page it jumps
-                    // to is the entry's stored page number.
+                connect_row_activated[sender] => move |_list, row| {
+                    // A row's index is a TOC entry index; the app maps it to
+                    // the entry's page and pins the highlight to the entry.
                     let index = row.index().max(0) as usize;
-                    let page = entries.borrow().get(index).map(|e| e.page).unwrap_or(index);
-                    let _ = sender.output(TocOutput::GoTo(page));
+                    let _ = sender.output(TocOutput::GoTo(index));
                 },
             },
         }
@@ -72,11 +68,7 @@ impl Component for TocSidebar {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         ensure_style_loaded();
-        let entries = Rc::new(RefCell::new(Vec::new()));
-        let model = TocSidebar {
-            entries: entries.clone(),
-            rows: Vec::new(),
-        };
+        let model = TocSidebar { rows: Vec::new() };
         let widgets = view_output!();
         ComponentParts { model, widgets }
     }
@@ -92,7 +84,6 @@ impl Component for TocSidebar {
             TocInput::Set(entries) => {
                 self.rows.clear();
                 rebuild(&widgets.toc_list, &entries, &mut self.rows);
-                *self.entries.borrow_mut() = entries;
             }
             TocInput::Highlight(index) => {
                 // A row clicked for navigation stays selected with an accent

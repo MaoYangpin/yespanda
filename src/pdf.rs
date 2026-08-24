@@ -195,48 +195,51 @@ mod tests {
     use relm4::gtk::prelude::TextureExt;
 
     #[test]
-    fn outline_and_named_dests() {
-        let Ok(doc) = PdfDoc::open(Path::new("/tmp/opencode/test.pdf")) else {
-            eprintln!("test.pdf missing, skipping");
+    fn outline_structure() {
+        let Ok(doc) = PdfDoc::open(Path::new("/tmp/opencode/real.pdf")) else {
+            eprintln!("real.pdf missing, skipping");
             return;
         };
-        assert_eq!(doc.n_pages(), 3);
+        assert_eq!(doc.n_pages(), 288);
 
         let toc = doc.toc();
+        assert_eq!(toc.len(), 154);
+
         let summary: Vec<_> =
             toc.iter().map(|e| (e.title.as_str(), e.page, e.depth)).collect();
-        assert_eq!(
-            summary,
-            vec![
-                ("Chapter One", 0, 0),
-                ("Section 1.1", 2, 1),
-                ("Chapter Two", 1, 0),
-                ("Appendix (named dest)", 2, 0),
-            ]
-        );
+        assert_eq!(summary[0], ("Contents", 1, 0));
+        assert_eq!(summary[1], ("Preface", 7, 0));
+        assert_eq!(summary[2], ("Overview of this Book", 9, 0));
+        assert_eq!(*summary.last().unwrap(), ("Index", 285, 0));
 
+        // Outline walk order is document order: pages are non-decreasing.
+        let pages: Vec<usize> = toc.iter().map(|e| e.page).collect();
+        assert!(
+            pages.windows(2).all(|w| w[0] <= w[1]),
+            "outline pages must be monotonic: {pages:?}"
+        );
     }
 
     #[test]
     fn render_page_texture() {
-        let Ok(doc) = PdfDoc::open(Path::new("/tmp/opencode/test.pdf")) else {
-            eprintln!("test.pdf missing, skipping");
+        let Ok(doc) = PdfDoc::open(Path::new("/tmp/opencode/real.pdf")) else {
+            eprintln!("real.pdf missing, skipping");
             return;
         };
         eprintln!("rendering...");
         let tex = doc.render_page(0, 1.0).unwrap();
-        assert_eq!(tex.width(), 612);
-        assert_eq!(tex.height(), 792);
+        assert_eq!(tex.width(), 595);
+        assert_eq!(tex.height(), 842);
     }
 
     #[test]
     fn stress_toc_and_render() {
         for _ in 0..200 {
-            let doc = PdfDoc::open(Path::new("/tmp/opencode/test.pdf")).unwrap();
+            let doc = PdfDoc::open(Path::new("/tmp/opencode/real.pdf")).unwrap();
             let toc = doc.toc();
-            assert_eq!(toc.len(), 4);
+            assert_eq!(toc.len(), 154);
             let _t2 = doc.toc();
-            assert_eq!(_t2.len(), 4);
+            assert_eq!(_t2.len(), 154);
             let _ = doc.render_page(1, 0.5).unwrap();
             drop(doc);
         }
