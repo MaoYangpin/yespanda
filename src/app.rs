@@ -315,6 +315,12 @@ pub struct AppModel {
     pages_box: gtk::Box,
     pages_scroller: gtk::ScrolledWindow,
     status_page: adw::StatusPage,
+    /// Lives inside the header bar's swap stack; hidden while searching.
+    title_widget: adw::WindowTitle,
+    /// Match counter shown next to the search entry in the header bar.
+    match_label: gtk::Label,
+    /// The search input inside the header bar's swap stack.
+    search_entry: gtk::SearchEntry,
     /// Search bar state.
     search_open: bool,
     search_query: String,
@@ -453,7 +459,7 @@ impl AppModel {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Document".into());
-        widgets.title_widget.set_title(&name);
+        self.title_widget.set_title(&name);
 
         self.toc.sender().send(TocInput::Set(entries)).ok();
         widgets.content_stack.set_visible_child_name("doc");
@@ -461,7 +467,7 @@ impl AppModel {
 
     fn show_error(&mut self, widgets: &mut AppModelWidgets, error: anyhow::Error) {
         widgets.content_stack.set_visible_child_name("empty");
-        widgets.title_widget.set_title("Error");
+        self.title_widget.set_title("Error");
         self.status_page.set_title("Could not open document");
         self.status_page.set_description(Some(&format!("{error:#}")));
     }
@@ -647,24 +653,24 @@ impl AppModel {
             source.remove();
         }
         self.search_open = false;
-        widgets.search_bar.set_search_mode(false);
+        widgets.header_stack.set_visible_child_name("title");
         self.search_query.clear();
         self.search_gen += 1;
         self.match_total = 0;
         self.current_flat = 0;
         self.view.matches.borrow_mut().clear();
         self.view.current_match.set(None);
-        widgets.match_label.set_label("");
+        self.match_label.set_label("");
     }
 
     /// Drop results (empty query) without hiding the bar.
-    fn clear_matches(&mut self, widgets: &mut AppModelWidgets) {
+    fn clear_matches(&mut self) {
         let redrawn: Vec<usize> = self.view.matches.borrow().keys().copied().collect();
         self.view.matches.borrow_mut().clear();
         self.view.current_match.set(None);
         self.match_total = 0;
         self.current_flat = 0;
-        widgets.match_label.set_label("");
+        self.match_label.set_label("");
         for index in redrawn {
             if let Some(page) = self.pages.get(index) {
                 page.queue_draw();
@@ -673,11 +679,7 @@ impl AppModel {
     }
 
     /// Install fresh scan results, select the first match and jump to it.
-    fn apply_search_results(
-        &mut self,
-        hits: HashMap<usize, Vec<MatchRect>>,
-        widgets: &mut AppModelWidgets,
-    ) {
+    fn apply_search_results(&mut self, hits: HashMap<usize, Vec<MatchRect>>) {
         let previous: Vec<usize> = self.view.matches.borrow().keys().copied().collect();
         let total: usize = hits.values().map(|rects| rects.len()).sum();
         *self.view.matches.borrow_mut() = hits;
@@ -691,7 +693,7 @@ impl AppModel {
         } else {
             "No matches".to_string()
         };
-        widgets.match_label.set_label(&label);
+        self.match_label.set_label(&label);
 
         for index in previous.iter().copied().chain(self.view.matches.borrow().keys().copied()) {
             if let Some(page) = self.pages.get(index) {
@@ -713,7 +715,7 @@ impl AppModel {
     }
 
     /// Move the active match by `delta` (wrapping) and scroll to it.
-    fn step_match(&mut self, delta: isize, widgets: &mut AppModelWidgets) {
+    fn step_match(&mut self, delta: isize) {
         if self.match_total == 0 {
             return;
         }
@@ -725,8 +727,7 @@ impl AppModel {
         let old_current = self.view.current_match.get();
         self.view.current_match.set(Some((page, index_in_page)));
         self.current_flat = next;
-        widgets
-            .match_label
+        self.match_label
             .set_label(&format!("{}/{}", next + 1, self.match_total));
         // Redraw only the two affected pages.
         let mut redraw = Vec::new();
@@ -893,44 +894,19 @@ impl Component for AppModel {
                     #[wrap(Some)]
                     set_child = &adw::ToolbarView {
                         add_top_bar = content_headerbar = &adw::HeaderBar {
+                            // Children are attached in init(): while
+                            // searching the title morphs into the search
+                            // field (Evince style); otherwise the plain
+                            // document title shows.
                             #[wrap(Some)]
-                            set_title_widget = title_widget = &adw::WindowTitle {
-                                set_title: "No document",
+                            set_title_widget = header_stack = &gtk::Stack {
+                                set_transition_type: gtk::StackTransitionType::Crossfade,
                             },
                         },
                         #[wrap(Some)]
-                        set_content = &gtk::Box {
-                            set_orientation: gtk::Orientation::Vertical,
-                            append: search_bar = &gtk::SearchBar {
-                                set_show_close_button: true,
-                                #[wrap(Some)]
-                                set_child = &gtk::Box {
-                                    set_spacing: 8,
-                                    set_margin_start: 8,
-                                    set_margin_end: 8,
-                                    append: search_entry = &gtk::SearchEntry {
-                                        set_hexpand: true,
-                                        set_placeholder_text: Some("Find in document…"),
-                                        connect_changed[sender] => move |entry| {
-                                            sender.input(AppMsg::SearchQuery(entry.text().into()));
-                                        },
-                                        connect_activate[sender] => move |_entry| {
-                                            sender.input(AppMsg::SearchNext);
-                                        },
-                                        connect_stop_search[sender] => move |_entry| {
-                                            sender.input(AppMsg::CloseSearch);
-                                        },
-                                    },
-                                    append: match_label = &gtk::Label {
-                                        set_valign: gtk::Align::Center,
-                                        set_width_chars: 10,
-                                    },
-                                },
-                            },
-                            append: content_stack = &gtk::Stack {
-                                set_vexpand: true,
-                                set_transition_type: gtk::StackTransitionType::Crossfade,
-                            },
+                        set_content = content_stack = &gtk::Stack {
+                            set_vexpand: true,
+                            set_transition_type: gtk::StackTransitionType::Crossfade,
                         },
                     },
                 },
@@ -976,6 +952,35 @@ impl Component for AppModel {
             .description("Start yespanda with a PDF file to view it.")
             .build();
 
+        // Header-bar search: the title swaps for an entry + match counter
+        // while a search is open.
+        let title_widget = adw::WindowTitle::builder()
+            .title("No document")
+            .build();
+        let search_entry = gtk::SearchEntry::builder()
+            .hexpand(true)
+            .width_chars(30)
+            .placeholder_text("Find in document…")
+            .build();
+        {
+            let tx = sender.input_sender().clone();
+            search_entry.connect_changed(move |entry| {
+                tx.send(AppMsg::SearchQuery(entry.text().into())).ok();
+            });
+            let tx = sender.input_sender().clone();
+            search_entry.connect_activate(move |_| {
+                tx.send(AppMsg::SearchNext).ok();
+            });
+            let tx = sender.input_sender().clone();
+            search_entry.connect_stop_search(move |_| {
+                tx.send(AppMsg::CloseSearch).ok();
+            });
+        }
+        let match_label = gtk::Label::builder()
+            .valign(gtk::Align::Center)
+            .width_chars(10)
+            .build();
+
         let view = Rc::new(ViewState::default());
 
         let model = AppModel {
@@ -991,6 +996,9 @@ impl Component for AppModel {
             pages_box: pages_box.clone(),
             pages_scroller: pages_scroller.clone(),
             status_page: status_page.clone(),
+            title_widget: title_widget.clone(),
+            match_label: match_label.clone(),
+            search_entry: search_entry.clone(),
             search_open: false,
             search_query: String::new(),
             search_gen: 0,
@@ -1011,18 +1019,17 @@ impl Component for AppModel {
 
         let widgets = view_output!();
 
-        // The search bar's close button toggles search-mode directly; route
-        // that through CloseSearch so the model stays in sync.
+        // Populate the header-bar swap stack: title first, search second.
         {
-            let tx = sender.input_sender().clone();
-            widgets.search_bar.connect_notify_local(
-                Some("search-mode-enabled"),
-                move |bar, _| {
-                    if !bar.is_search_mode() {
-                        tx.send(AppMsg::CloseSearch).ok();
-                    }
-                },
-            );
+            let search_row = gtk::Box::builder()
+                .spacing(8)
+                .build();
+            let entry = search_entry.clone();
+            search_row.append(&entry);
+            search_row.append(&match_label);
+            widgets.header_stack.add_named(&title_widget, Some("title"));
+            widgets.header_stack.add_named(&search_row, Some("search"));
+            widgets.header_stack.set_visible_child_name("title");
         }
 
         // Focus the PDF content once the window maps, so j/k/h/l scroll the
@@ -1378,8 +1385,8 @@ impl Component for AppModel {
             }
             AppMsg::OpenSearch => {
                 self.search_open = true;
-                widgets.search_bar.set_search_mode(true);
-                let entry = widgets.search_entry.clone();
+                widgets.header_stack.set_visible_child_name("search");
+                let entry = self.search_entry.clone();
                 glib::idle_add_local_once(move || {
                     entry.grab_focus();
                 });
@@ -1389,7 +1396,7 @@ impl Component for AppModel {
                     return;
                 }
                 self.search_open = false;
-                widgets.search_bar.set_search_mode(false);
+                widgets.header_stack.set_visible_child_name("title");
                 self.pages_scroller.grab_focus();
             }
             AppMsg::SearchQuery(text) => {
@@ -1400,7 +1407,7 @@ impl Component for AppModel {
                 // Empty query clears results immediately; otherwise wait
                 // for typing to settle before scanning the whole document.
                 if text.trim().is_empty() {
-                    self.clear_matches(widgets);
+                    self.clear_matches();
                     return;
                 }
                 let tx = sender.input_sender().clone();
@@ -1432,10 +1439,10 @@ impl Component for AppModel {
                 if generation != self.search_gen {
                     return;
                 }
-                self.apply_search_results(hits, widgets);
+                self.apply_search_results(hits);
             }
-            AppMsg::SearchNext => self.step_match(1, widgets),
-            AppMsg::SearchPrev => self.step_match(-1, widgets),
+            AppMsg::SearchNext => self.step_match(1),
+            AppMsg::SearchPrev => self.step_match(-1),
         }
         self.update_view(widgets, sender);
     }
