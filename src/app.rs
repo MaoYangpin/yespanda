@@ -23,29 +23,72 @@ const SCROLL_STEP_FRACTION: f64 = 0.25;
 /// Window in which a chord's completing key must follow its leader.
 const CHORD_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Advance the two-key chord state machine on a key press. Returns the
-/// action to fire (and clears the leader) if the press completed a chord.
-/// Completion is checked before arming because a key can be both leader and
-/// completing key (`space space`).
+/// Chord state machine state: the armed leader key plus, while a count is
+/// being typed after the leader (`g 1 2`), the accumulated page number.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct ChordState {
+    leader: Option<(gdk::Key, std::time::Instant)>,
+    /// Page number typed so far; 0 means not collecting.
+    count: u32,
+}
+
+/// Advance the chord state machine on a key press. Returns the action to
+/// fire if the press completed something.
+///
+/// Two behaviors share one leader key:
+/// - two-key chords (`space e`, `space space`, `g g`) complete within
+///   [`CHORD_WINDOW`], checked before arming because a key can be both
+///   leader and completing key (`space space`);
+/// - while the count leader (`g`) is armed, digit keys accumulate a page
+///   number (no time limit), and `Enter` fires [`AppMsg::GoToPage`]. Any
+///   other key cancels the collection and is processed as a fresh press.
 fn chord_press(
     chords: &[(gdk::Key, gdk::Key, AppMsg)],
-    leader: &mut Option<(gdk::Key, std::time::Instant)>,
+    count_leader: Option<gdk::Key>,
+    state: &mut ChordState,
     keyval: gdk::Key,
     now: std::time::Instant,
 ) -> Option<AppMsg> {
-    if let Some((armed, pressed)) = *leader
+    let digit = keyval.to_unicode().and_then(|char| char.to_digit(10));
+    if state.count > 0 {
+        if let Some(digit) = digit {
+            state.count = state.count.saturating_mul(10).saturating_add(digit);
+            return None;
+        }
+        if matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter) {
+            let page = state.count;
+            *state = ChordState::default();
+            return Some(AppMsg::GoToPage(page));
+        }
+        // Any other key cancels the collection; continue below so it is
+        // handled like a fresh press (bindings loop, re-arming, ...).
+        *state = ChordState::default();
+    } else if state.leader.is_some() && count_leader == state.leader.map(|(key, _)| key) {
+        // First digit starts the collection (count was still 0).
+        if let Some(digit) = digit {
+            *state = ChordState {
+                leader: state.leader,
+                count: digit,
+            };
+            return None;
+        }
+    }
+    if let Some((armed, pressed)) = state.leader
         && now.duration_since(pressed) <= CHORD_WINDOW
             && let Some((_, _, msg)) = chords
                 .iter()
                 .find(|(leader_key, chord_key, _)| *leader_key == armed && *chord_key == keyval)
             {
-                *leader = None;
+                *state = ChordState::default();
                 return Some(msg.clone());
             }
     if chords.iter().any(|(leader_key, _, _)| *leader_key == keyval) {
-        *leader = Some((keyval, now));
+        *state = ChordState {
+            leader: Some((keyval, now)),
+            count: 0,
+        };
     } else {
-        *leader = None;
+        *state = ChordState::default();
     }
     None
 }
@@ -94,6 +137,9 @@ pub enum AppMsg {
     ScrollTop,
     /// Jump to the end of the document (`G`).
     ScrollBottom,
+    /// Jump to a 1-based page number typed after the `g` leader
+    /// (`g 4 2 <Enter>`). Clamped to the document's page count.
+    GoToPage(u32),
     ToggleSidebar,
     /// Move keyboard focus to the TOC sidebar (Ctrl+h). Never scrolls the
     /// PDF or changes the position highlight.
@@ -625,24 +671,33 @@ impl Component for AppModel {
             Some((leader, key, msg))
         })
         .collect();
-        let leader: Rc<std::cell::Cell<Option<(gdk::Key, std::time::Instant)>>> = Rc::default();
+        let chord_state: Rc<std::cell::Cell<ChordState>> = Rc::default();
+        // The leader that accepts digit counts for page jumps comes from
+        // the same `[keymap]` entry as the scroll-top chord (`g g`).
+        let count_leader = keymap
+            .scroll_top
+            .split_whitespace()
+            .next()
+            .and_then(gdk::Key::from_name);
         let key_controller = gtk::EventControllerKey::new();
         {
-            let leader = leader.clone();
+            let chord_state = chord_state.clone();
             let forward = sender.clone();
             key_controller.connect_key_pressed(move |_, keyval, _, state| {
                 let now = std::time::Instant::now();
-                let mut leader_state = leader.get();
+                let mut chord = chord_state.get();
                 if state.is_empty() {
-                    if let Some(msg) = chord_press(&chords, &mut leader_state, keyval, now) {
+                    if let Some(msg) =
+                        chord_press(&chords, count_leader, &mut chord, keyval, now)
+                    {
                         forward.input(msg);
-                        leader.set(leader_state);
+                        chord_state.set(chord);
                         return glib::Propagation::Stop;
                     }
                 } else {
-                    leader_state = None;
+                    chord = ChordState::default();
                 }
-                leader.set(leader_state);
+                chord_state.set(chord);
                 for (msg, modifiers, key) in &bindings {
                     if state == *modifiers && keyval == *key {
                         forward.input(msg.clone());
@@ -720,6 +775,14 @@ impl Component for AppModel {
                     // Returning focus to the content lets j/k/h/l scroll the
                     // PDF again after opening an entry with `l` or a click.
                     self.pages_scroller.grab_focus();
+                }
+            }
+            AppMsg::GoToPage(page) => {
+                // 1-based as typed; `scroll_to_page` ignores out-of-range
+                // pages, so clamping is all that is needed here.
+                let index = (page as usize).saturating_sub(1);
+                if index < self.pictures.len() {
+                    self.scroll_to_page(index);
                 }
             }
             AppMsg::ViewportChanged => {
@@ -817,85 +880,177 @@ mod tests {
     fn gg_fires_scroll_top() {
         let chords = chords();
         let t0 = std::time::Instant::now();
-        let mut leader = None;
+        let mut state = ChordState::default();
         // First g arms the leader; it must NOT fire yet.
-        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::g, t0), None);
-        assert!(leader.is_some());
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::g, t0), None);
+        assert!(state.leader.is_some());
         // Second g within the window completes the chord.
         assert_eq!(
-            chord_press(&chords, &mut leader, gdk::Key::g, t0 + Duration::from_millis(100)),
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::g, t0 + Duration::from_millis(100)),
             Some(AppMsg::ScrollTop)
         );
-        assert!(leader.is_none());
+        assert!(state.leader.is_none());
     }
 
     #[test]
     fn g_then_capital_g_leaves_jump_to_bindings() {
         let chords = chords();
         let t0 = std::time::Instant::now();
-        let mut leader = None;
-        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::g, t0), None);
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::g, t0), None);
         // G (Shift+g) is not a chord completer and not a leader: the chord
         // state machine must drop the leader so the plain Shift+G binding
         // can fire in the bindings loop instead.
         assert_eq!(
-            chord_press(&chords, &mut leader, gdk::Key::G, t0 + Duration::from_millis(100)),
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::G, t0 + Duration::from_millis(100)),
             None
         );
-        assert!(leader.is_none());
+        assert!(state.leader.is_none());
     }
 
     #[test]
     fn space_space_fires_pick_file() {
         let chords = chords();
         let t0 = std::time::Instant::now();
-        let mut leader = None;
+        let mut state = ChordState::default();
         // First Space arms the leader; it must NOT fire yet.
-        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::space, t0), None);
-        assert!(leader.is_some());
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::space, t0), None);
+        assert!(state.leader.is_some());
         // Second Space within the window completes the chord.
         assert_eq!(
-            chord_press(&chords, &mut leader, gdk::Key::space, t0 + Duration::from_millis(100)),
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::space, t0 + Duration::from_millis(100)),
             Some(AppMsg::PickFile)
         );
-        assert!(leader.is_none());
+        assert!(state.leader.is_none());
     }
 
     #[test]
     fn space_e_fires_toggle_sidebar() {
         let chords = chords();
         let t0 = std::time::Instant::now();
-        let mut leader = None;
-        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::space, t0), None);
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::space, t0), None);
         assert_eq!(
-            chord_press(&chords, &mut leader, gdk::Key::e, t0 + Duration::from_millis(100)),
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::e, t0 + Duration::from_millis(100)),
             Some(AppMsg::ToggleSidebar)
         );
-        assert!(leader.is_none());
+        assert!(state.leader.is_none());
     }
 
     #[test]
     fn chord_expires_but_leader_rearms() {
         let chords = chords();
         let t0 = std::time::Instant::now();
-        let mut leader = None;
-        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::space, t0), None);
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::space, t0), None);
         // Too slow: no fire, but Space is still a leader so it re-arms.
         assert_eq!(
-            chord_press(&chords, &mut leader, gdk::Key::space, t0 + Duration::from_millis(1000)),
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::space, t0 + Duration::from_millis(1000)),
             None
         );
-        assert!(leader.is_some());
+        assert!(state.leader.is_some());
     }
 
     #[test]
     fn unrelated_key_clears_leader() {
         let chords = chords();
         let t0 = std::time::Instant::now();
-        let mut leader = None;
-        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::space, t0), None);
-        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::j, t0 + Duration::from_millis(50)), None);
-        assert!(leader.is_none());
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::space, t0), None);
+        assert_eq!(
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::j, t0 + Duration::from_millis(50)),
+            None
+        );
+        assert!(state.leader.is_none());
+    }
+
+    #[test]
+    fn g_digits_enter_fires_go_to_page() {
+        let chords = chords();
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::g, t0), None);
+        // Digits collect with no time limit and do not fire.
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::_4, at(100)), None);
+        assert_eq!(state.count, 4);
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::_2, at(2000)), None);
+        assert_eq!(state.count, 42);
+        // Enter commits as a 1-based page jump.
+        assert_eq!(
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::Return, at(2500)),
+            Some(AppMsg::GoToPage(42))
+        );
+        assert_eq!(state, ChordState::default());
+    }
+
+    #[test]
+    fn go_to_page_leading_zeros_and_keypad_enter() {
+        let chords = chords();
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::g, t0), None);
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::_0, at(50)), None);
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::_7, at(100)), None);
+        assert_eq!(
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::KP_Enter, at(150)),
+            Some(AppMsg::GoToPage(7))
+        );
+    }
+
+    #[test]
+    fn digit_without_leader_is_ignored() {
+        let chords = chords();
+        let t0 = std::time::Instant::now();
+        let mut state = ChordState::default();
+        // Plain typing never starts collecting; nothing fires or stores.
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::_5, t0), None);
+        assert_eq!(state, ChordState::default());
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::Return, t0), None);
+    }
+
+    #[test]
+    fn other_key_cancels_collection_and_falls_through() {
+        let chords = chords();
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::g, t0), None);
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::_1, at(50)), None);
+        // j cancels the collection (returns None so the bindings loop can
+        // scroll) and resets the count.
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::j, at(100)), None);
+        assert_eq!(state, ChordState::default());
+    }
+
+    #[test]
+    fn escape_clears_collection() {
+        let chords = chords();
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::g, t0), None);
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::_9, at(50)), None);
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::Escape, at(100)), None);
+        assert_eq!(state, ChordState::default());
+    }
+
+    #[test]
+    fn long_digit_run_saturates_without_panic() {
+        let chords = chords();
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut state = ChordState::default();
+        assert_eq!(chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::g, t0), None);
+        for ms in 1..40u64 {
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::_9, at(ms * 10));
+        }
+        assert_eq!(state.count, u32::MAX);
+        assert_eq!(
+            chord_press(&chords, Some(gdk::Key::g), &mut state, gdk::Key::Return, at(400)),
+            Some(AppMsg::GoToPage(u32::MAX))
+        );
     }
 }
 

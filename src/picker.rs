@@ -47,6 +47,9 @@ pub struct PickerDialog {
     results: Vec<String>,
     done: bool,
     search_source: Option<glib::SourceId>,
+    /// Result rows live here; built outside `view!` so rows can be
+    /// `adw::ActionRow`s inside a `.boxed-list`.
+    results_list: gtk::ListBox,
 }
 
 #[derive(Debug)]
@@ -90,13 +93,19 @@ impl Component for PickerDialog {
             #[wrap(Some)]
             set_child = content_box = &gtk::Box {
                 set_orientation: gtk::Orientation::Vertical,
-                set_spacing: 6,
-                set_margin_top: 8,
-                set_margin_bottom: 10,
-                set_margin_start: 10,
-                set_margin_end: 10,
-                append: search_entry = &gtk::Entry {
+                set_spacing: 12,
+                set_margin_top: 12,
+                set_margin_bottom: 12,
+                set_margin_start: 12,
+                set_margin_end: 12,
+                append: search_entry = &gtk::SearchEntry {
                     set_placeholder_text: Some("Filter PDFs…"),
+                    // Match the boxed-list's horizontal inset so the field
+                    // lines up with the result card below it.
+                    set_margin_top: 6,
+                    set_margin_bottom: 6,
+                    set_margin_start: 6,
+                    set_margin_end: 6,
                     connect_changed[sender] => move |entry| {
                         sender.input(PickerMsg::Query(entry.text().into()));
                     },
@@ -107,11 +116,8 @@ impl Component for PickerDialog {
                 append: results_scroller = &gtk::ScrolledWindow {
                     set_vexpand: true,
                     #[wrap(Some)]
-                    set_child = results_list = &gtk::ListBox {
-                        set_selection_mode: gtk::SelectionMode::Single,
-                        connect_row_activated[sender] => move |_list, row| {
-                            sender.input(PickerMsg::Confirm(row.index().max(0) as usize));
-                        },
+                    set_child = results_stack = &gtk::Stack {
+                        set_vhomogeneous: false,
                     },
                 },
             },
@@ -123,26 +129,68 @@ impl Component for PickerDialog {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        // The result list is a boxed-list card of ActionRows; it lives on
+        // the model because `view!` only declares the stack that hosts it.
+        let results_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
+            .css_classes(["boxed-list"])
+            .valign(gtk::Align::Start)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        {
+            let sender = sender.clone();
+            results_list.connect_row_activated(move |_list, row| {
+                sender.input(PickerMsg::Confirm(row.index().max(0) as usize));
+            });
+        }
+
         let model = PickerDialog {
             candidates: Vec::new(),
             results: Vec::new(),
             done: false,
             search_source: None,
+            results_list: results_list.clone(),
         };
 
         let widgets = view_output!();
+
+        // Two stack pages: the result card and an empty-state notice.
+        let empty_page = adw::StatusPage::builder()
+            .icon_name("system-search-symbolic")
+            .title("No matching files")
+            .description("Try a different search term.")
+            .build();
+        widgets.results_stack.add_named(&results_list, Some("results"));
+        widgets.results_stack.add_named(&empty_page, Some("empty"));
+        widgets.results_stack.set_visible_child_name("empty");
+
+        // GtkSearchEntry consumes Escape itself (emitting `stop-search`)
+        // before the event can reach the window-level key controller, so
+        // Esc while typing must be handled here.
+        {
+            let window = root.clone();
+            widgets.search_entry.connect_stop_search(move |_| {
+                window.close();
+            });
+        }
+
         root.set_content_width(init.width);
         root.set_content_height(init.height);
         root.present(Some(&init.parent));
 
         // Esc closes the dialog; Ctrl+n / Ctrl+p move through the input line
-        // and the result rows (the entry is the "first line").
+        // and the result rows (the entry is the "first line"); Enter or
+        // space opens the selected row.
         let key_controller = gtk::EventControllerKey::new();
         {
             let window = root.clone();
             let entry = widgets.search_entry.clone();
-            let list = widgets.results_list.clone();
+            let list = results_list.clone();
             let scroller = widgets.results_scroller.clone();
+            let forward = sender.input_sender().clone();
             key_controller.connect_key_pressed(move |_, keyval, _, state| {
                 if keyval == gdk::Key::Escape {
                     // Closing fires `close_request`, which emits Cancelled.
@@ -158,6 +206,17 @@ impl Component for PickerDialog {
                         move_selection(&entry, &scroller, &list, -1);
                         return glib::Propagation::Stop;
                     }
+                    return glib::Propagation::Proceed;
+                }
+                // AdwActionRow consumes Enter/space for its own activation
+                // before GtkListBox can emit row-activated, so open the
+                // selected row here instead.
+                if matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space)
+                    && !entry.has_focus()
+                    && let Some(row) = list.selected_row()
+                {
+                    forward.send(PickerMsg::Confirm(row.index().max(0) as usize)).ok();
+                    return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
             });
@@ -219,7 +278,8 @@ impl Component for PickerDialog {
             PickerMsg::Candidates(paths) => {
                 self.candidates = paths;
                 self.results = filter(&self.candidates, "");
-                rebuild_list(&widgets.results_list, &self.results);
+                rebuild_list(&self.results_list, &self.results);
+                update_stack_page(widgets, self.results.len());
             }
             PickerMsg::Query(text) => {
                 if let Some(source) = self.search_source.take() {
@@ -245,7 +305,8 @@ impl Component for PickerDialog {
             }
             PickerMsg::Results(results) => {
                 self.results = results;
-                rebuild_list(&widgets.results_list, &self.results);
+                rebuild_list(&self.results_list, &self.results);
+                update_stack_page(widgets, self.results.len());
             }
             PickerMsg::Confirm(index) => {
                 if !self.done
@@ -256,7 +317,7 @@ impl Component for PickerDialog {
                     }
             }
             PickerMsg::ConfirmCurrent => {
-                if let Some(row) = widgets.results_list.selected_row() {
+                if let Some(row) = self.results_list.selected_row() {
                     let index = row.index().max(0) as usize;
                     if !self.done
                         && let Some(path) = self.results.get(index) {
@@ -332,7 +393,7 @@ fn parse_nul(bytes: &[u8]) -> Vec<String> {
 /// as the line above the first result row, so Ctrl+p on the first result
 /// returns focus to the input, and Ctrl+n on the input selects the first.
 fn move_selection(
-    entry: &gtk::Entry,
+    entry: &gtk::SearchEntry,
     scroller: &gtk::ScrolledWindow,
     list: &gtk::ListBox,
     delta: isize,
@@ -385,18 +446,55 @@ fn scroll_row_into_view(
     adjustment.set_value(value.clamp(adjustment.lower(), max));
 }
 
+/// Split a path into `(file name, parent directory)`, abbreviating a
+/// `$HOME` prefix in the directory as `~`. The directory is empty when the
+/// path has no parent.
+fn split_path(path: &str) -> (String, String) {
+    let path = std::path::Path::new(path);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let dir = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let home = home_dir();
+    let dir = if dir == home {
+        "~".to_string()
+    } else if let Some(rest) = dir.strip_prefix(&format!("{home}/")) {
+        format!("~/{rest}")
+    } else {
+        dir
+    };
+    (name, dir)
+}
+
+/// Fill the result list with one ActionRow per match: the file name as the
+/// title, its (tilde-abbreviated) directory as the dimmed subtitle.
 fn rebuild_list(list: &gtk::ListBox, results: &[String]) {
     list.remove_all();
     for path in results {
-        let label = gtk::Label::builder()
-            .label(path)
-            .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .xalign(0.0)
-            .margin_top(3)
-            .margin_bottom(3)
-            .build();
-        list.append(&label);
+        let (name, dir) = split_path(path);
+        let row = adw::ActionRow::new();
+        // Titles are parsed as Pango markup by default; file names with a
+        // raw `&` (e.g. `html & css.pdf`) would fail to render otherwise.
+        row.set_use_markup(false);
+        row.set_title(&name);
+        if !dir.is_empty() {
+            row.set_subtitle(&dir);
+        }
+        list.append(&row);
     }
+}
+
+/// Show the empty-state page when a filter yields nothing.
+fn update_stack_page(widgets: &PickerDialogWidgets, result_count: usize) {
+    widgets.results_stack.set_visible_child_name(if result_count == 0 {
+        "empty"
+    } else {
+        "results"
+    });
 }
 
 #[cfg(test)]
@@ -415,6 +513,30 @@ mod tests {
         assert_eq!(expand_root(""), home);
         assert_eq!(expand_root("~/docs"), format!("{home}/docs"));
         assert_eq!(expand_root("/tmp/opencode"), "/tmp/opencode".to_string());
+    }
+
+    #[test]
+    fn split_path_abbreviates_home() {
+        let home = home_dir();
+        assert_eq!(
+            split_path(&format!("{home}/Books/ai/math.pdf")),
+            ("math.pdf".to_string(), "~/Books/ai".to_string())
+        );
+        // Directly inside $HOME collapses to just `~`.
+        assert_eq!(
+            split_path(&format!("{home}/x.pdf")),
+            ("x.pdf".to_string(), "~".to_string())
+        );
+        // Paths outside $HOME stay absolute.
+        assert_eq!(
+            split_path("/mnt/data/report.pdf"),
+            ("report.pdf".to_string(), "/mnt/data".to_string())
+        );
+        // A bare file name has no directory part.
+        assert_eq!(
+            split_path("solo.pdf"),
+            ("solo.pdf".to_string(), String::new())
+        );
     }
 
     #[test]

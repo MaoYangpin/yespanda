@@ -131,7 +131,8 @@ impl Default for SidebarConfig {
 /// Key bindings. Each value is a space-separated list of modifiers (e.g.
 /// `ctrl`, `shift`, `alt`, `super`) followed by a key name (`j`, `space`,
 /// `plus`...); a missing/unknown key disables the binding. `sidebar_toggle`
-/// and `scroll_top` are two-key chords (`space e`, `g g`) instead.
+/// and `scroll_top` are two-key chords (`space e`, `g g`) instead, and the
+/// `g` leader doubles as a page-jump prefix (`g 4 2 <Enter>`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeymapConfig {
     #[serde(default = "key_default_scroll_down")]
