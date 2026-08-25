@@ -20,19 +20,21 @@ pub fn parse_binding(spec: &str) -> Option<(gdk::ModifierType, gdk::Key)> {
             "super" | "meta" | "cmd" => modifiers |= gdk::ModifierType::SUPER_MASK,
             "space" => key = Some(gdk::Key::space),
             other => {
-                if let Some(k) = gdk::Key::from_name(other) {
-                    key = Some(k);
-                } else {
+                // Preserve the original case for the key itself: Shift+g
+                // produces the uppercase keyval (`G`), so a binding spelled
+                // `shift G` must look up the uppercase key name.
+                let token = raw.trim_matches(['<', '>']);
+                let parsed = gdk::Key::from_name(token).or_else(|| {
                     // Accept the printed symbol for common punctuation keys.
-                    let symbol = match other {
+                    gdk::Key::from_name(match other {
                         "plus" => "+",
                         "minus" => "-",
                         "equal" => "=",
-                        _ => other,
-                    };
-                    if let Some(k) = gdk::Key::from_name(symbol) {
-                        key = Some(k);
-                    }
+                        _ => return None,
+                    })
+                });
+                if let Some(k) = parsed {
+                    key = Some(k);
                 }
             }
         }
@@ -129,7 +131,7 @@ impl Default for SidebarConfig {
 /// Key bindings. Each value is a space-separated list of modifiers (e.g.
 /// `ctrl`, `shift`, `alt`, `super`) followed by a key name (`j`, `space`,
 /// `plus`...); a missing/unknown key disables the binding. `sidebar_toggle`
-/// is a two-key chord (`space e`) instead.
+/// and `scroll_top` are two-key chords (`space e`, `g g`) instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeymapConfig {
     #[serde(default = "key_default_scroll_down")]
@@ -140,6 +142,12 @@ pub struct KeymapConfig {
     pub scroll_left: String,
     #[serde(default = "key_default_scroll_right")]
     pub scroll_right: String,
+    /// Two-key chord (`g g`) jumping to the start of the document.
+    #[serde(default = "key_default_scroll_top")]
+    pub scroll_top: String,
+    /// Jump to the end of the document (Shift+G).
+    #[serde(default = "key_default_scroll_bottom")]
+    pub scroll_bottom: String,
     /// Two-key chord: `<leader> <key>` toggles the sidebar.
     #[serde(default = "key_default_sidebar_toggle")]
     pub sidebar_toggle: String,
@@ -185,6 +193,8 @@ key_default!(key_default_scroll_down, "j");
 key_default!(key_default_scroll_up, "k");
 key_default!(key_default_scroll_left, "h");
 key_default!(key_default_scroll_right, "l");
+key_default!(key_default_scroll_top, "g g");
+key_default!(key_default_scroll_bottom, "shift G");
 key_default!(key_default_sidebar_toggle, "space e");
 key_default!(key_default_sidebar_down, "j");
 key_default!(key_default_sidebar_up, "k");
@@ -204,6 +214,8 @@ impl Default for KeymapConfig {
             scroll_up: "k".into(),
             scroll_left: "h".into(),
             scroll_right: "l".into(),
+            scroll_top: "g g".into(),
+            scroll_bottom: "shift G".into(),
             sidebar_toggle: "space e".into(),
             sidebar_down: "j".into(),
             sidebar_up: "k".into(),
@@ -387,6 +399,17 @@ mod tests {
             parse_binding(&keymap.sidebar_activate),
             Some((gdk::ModifierType::empty(), gdk::Key::l))
         );
+        assert_eq!(
+            parse_binding(&keymap.scroll_bottom),
+            Some((gdk::ModifierType::SHIFT_MASK, gdk::Key::G))
+        );
+        // The scroll_top chord must split into two valid key names.
+        let mut tokens = keymap.scroll_top.split_whitespace();
+        let leader = tokens.next().and_then(gdk::Key::from_name);
+        let completer = tokens.next().and_then(gdk::Key::from_name);
+        assert_eq!(leader, Some(gdk::Key::g));
+        assert_eq!(completer, Some(gdk::Key::g));
+        assert!(tokens.next().is_none());
         assert_eq!(parse_binding("bogus_key"), None);
         assert_eq!(parse_binding(""), None);
     }

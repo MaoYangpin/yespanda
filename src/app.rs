@@ -90,6 +90,10 @@ pub enum AppMsg {
     ScrollUp,
     ScrollLeft,
     ScrollRight,
+    /// Jump to the start of the document (`g g` chord).
+    ScrollTop,
+    /// Jump to the end of the document (`G`).
+    ScrollBottom,
     ToggleSidebar,
     /// Move keyboard focus to the TOC sidebar (Ctrl+h). Never scrolls the
     /// PDF or changes the position highlight.
@@ -595,6 +599,7 @@ impl Component for AppModel {
             (AppMsg::ScrollUp, &keymap.scroll_up),
             (AppMsg::ScrollLeft, &keymap.scroll_left),
             (AppMsg::ScrollRight, &keymap.scroll_right),
+            (AppMsg::ScrollBottom, &keymap.scroll_bottom),
             (AppMsg::FocusSidebar, &keymap.focus_sidebar),
             (AppMsg::FocusPdf, &keymap.focus_pdf),
             (AppMsg::ZoomIn, &keymap.zoom_in),
@@ -610,6 +615,7 @@ impl Component for AppModel {
         let chords: Vec<(gdk::Key, gdk::Key, AppMsg)> = [
             (&keymap.sidebar_toggle, AppMsg::ToggleSidebar),
             (&keymap.pick_file_chord, AppMsg::PickFile),
+            (&keymap.scroll_top, AppMsg::ScrollTop),
         ]
         .into_iter()
         .filter_map(|(spec, msg)| {
@@ -730,6 +736,17 @@ impl Component for AppModel {
             ),
             AppMsg::ScrollLeft => self.scroll_horizontal(-40.0),
             AppMsg::ScrollRight => self.scroll_horizontal(40.0),
+            AppMsg::ScrollTop => {
+                let adjustment = self.pages_scroller.vadjustment();
+                adjustment.set_value(adjustment.lower());
+            }
+            AppMsg::ScrollBottom => {
+                let adjustment = self.pages_scroller.vadjustment();
+                // Never clamp below the lower bound; a short document
+                // (content shorter than the viewport) has no room to move.
+                let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+                adjustment.set_value(max);
+            }
             AppMsg::ToggleSidebar => {
                 let collapsed = !widgets.split_view.is_collapsed();
                 // Keep the content page visible while collapsed so the sidebar
@@ -792,7 +809,40 @@ mod tests {
         vec![
             (gdk::Key::space, gdk::Key::e, AppMsg::ToggleSidebar),
             (gdk::Key::space, gdk::Key::space, AppMsg::PickFile),
+            (gdk::Key::g, gdk::Key::g, AppMsg::ScrollTop),
         ]
+    }
+
+    #[test]
+    fn gg_fires_scroll_top() {
+        let chords = chords();
+        let t0 = std::time::Instant::now();
+        let mut leader = None;
+        // First g arms the leader; it must NOT fire yet.
+        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::g, t0), None);
+        assert!(leader.is_some());
+        // Second g within the window completes the chord.
+        assert_eq!(
+            chord_press(&chords, &mut leader, gdk::Key::g, t0 + Duration::from_millis(100)),
+            Some(AppMsg::ScrollTop)
+        );
+        assert!(leader.is_none());
+    }
+
+    #[test]
+    fn g_then_capital_g_leaves_jump_to_bindings() {
+        let chords = chords();
+        let t0 = std::time::Instant::now();
+        let mut leader = None;
+        assert_eq!(chord_press(&chords, &mut leader, gdk::Key::g, t0), None);
+        // G (Shift+g) is not a chord completer and not a leader: the chord
+        // state machine must drop the leader so the plain Shift+G binding
+        // can fire in the bindings loop instead.
+        assert_eq!(
+            chord_press(&chords, &mut leader, gdk::Key::G, t0 + Duration::from_millis(100)),
+            None
+        );
+        assert!(leader.is_none());
     }
 
     #[test]
