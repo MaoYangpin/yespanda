@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#33d17a"/>
+      <stop offset="1" stop-color="#26a269"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded app-tile background -->
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#bg)"/>
+
+  <!-- bamboo leaves, bottom-right accent -->
+  <path d="M96 104 q10 -14 26 -16 q-12 12 -26 16 z" fill="#8ff0a4" opacity=".85"/>
+  <path d="M100 112 q16 -4 22 -14 q-16 2 -22 14 z" fill="#8ff0a4" opacity=".65"/>
+
+  <!-- ears (head overlaps their inner halves) -->
+  <circle cx="36" cy="36" r="15" fill="#241f31"/>
+  <circle cx="92" cy="36" r="15" fill="#241f31"/>
+
+  <!-- head -->
+  <ellipse cx="64" cy="66" rx="42" ry="38" fill="#ffffff"/>
+
+  <!-- eye patches -->
+  <ellipse cx="46" cy="62" rx="13" ry="16" fill="#241f31" transform="rotate(-18 46 62)"/>
+  <ellipse cx="82" cy="62" rx="13" ry="16" fill="#241f31" transform="rotate(18 82 62)"/>
+
+  <!-- eyes -->
+  <circle cx="48" cy="60" r="4.5" fill="#ffffff"/>
+  <circle cx="80" cy="60" r="4.5" fill="#ffffff"/>
+
+  <!-- nose -->
+  <path d="M59 78 h10 l-5 7 z" fill="#241f31"/>
+
+  <!-- mouth -->
+  <path d="M64 85 q0 6 -6 7 M64 85 q0 6 6 7" stroke="#241f31" stroke-width="3" fill="none" stroke-linecap="round"/>
+</svg>

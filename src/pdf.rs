@@ -11,13 +11,18 @@ use poppler::{
         poppler_index_iter_get_child, poppler_index_iter_new, poppler_index_iter_next,
     },
 };
-use relm4::gtk::gdk;
 use relm4::gtk::glib;
 use relm4::gtk::glib::translate::ToGlibPtr;
 
 pub struct PdfDoc {
     doc: Document,
 }
+
+// SAFETY: PdfDoc has no interior mutability and is always used by a single
+// owner at a time (the app hands it to one dedicated renderer thread after
+// opening). poppler-glib objects are not thread-safe for concurrent access,
+// but sequential access from whichever thread owns the handle is fine.
+unsafe impl Send for PdfDoc {}
 
 #[derive(Clone, Debug)]
 pub struct TocEntry {
@@ -138,17 +143,6 @@ impl PdfDoc {
         }
     }
 
-    pub fn render_page(&self, index: usize, zoom: f64) -> Result<gdk::MemoryTexture> {
-        let (width, height, packed) = self.render_page_bytes(index, zoom)?;
-        Ok(gdk::MemoryTexture::new(
-            width,
-            height,
-            gdk::MemoryFormat::B8g8r8a8Premultiplied,
-            &glib::Bytes::from_owned(packed),
-            width as usize * 4,
-        ))
-    }
-
     /// Render a page to packed BGRA bytes `(width, height, data)`. Uses only
     /// cairo (no GDK objects), so it is safe to call off the main thread.
     pub fn render_page_bytes(&self, index: usize, zoom: f64) -> Result<(i32, i32, Vec<u8>)> {
@@ -199,7 +193,6 @@ fn glib_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relm4::gtk::prelude::TextureExt;
 
     #[test]
     fn outline_structure() {
@@ -234,9 +227,9 @@ mod tests {
             return;
         };
         eprintln!("rendering...");
-        let tex = doc.render_page(0, 1.0).unwrap();
-        assert_eq!(tex.width(), 595);
-        assert_eq!(tex.height(), 842);
+        let (width, height, _bytes) = doc.render_page_bytes(0, 1.0).unwrap();
+        assert_eq!(width, 595);
+        assert_eq!(height, 842);
     }
 
     #[test]
@@ -247,7 +240,7 @@ mod tests {
             assert_eq!(toc.len(), 154);
             let _t2 = doc.toc();
             assert_eq!(_t2.len(), 154);
-            let _ = doc.render_page(1, 0.5).unwrap();
+            let _ = doc.render_page_bytes(1, 0.5).unwrap();
             drop(doc);
         }
     }

@@ -93,8 +93,87 @@ fn chord_press(
     None
 }
 
+/// One viewport batch of pages to render off the main thread.
+struct RenderJob {
+    generation: u64,
+    zoom: f64,
+    indexes: Vec<usize>,
+}
+
+/// Owns the `PdfDoc` on a worker thread and turns render requests into
+/// [`AppMsg::PageRendered`] replies. Dropping the `Renderer` closes the
+/// channel and ends the thread (the old document is released with it).
+struct Renderer {
+    tx: std::sync::mpsc::Sender<RenderJob>,
+}
+
+impl Renderer {
+    /// Hand `doc` over to a fresh worker thread. The document was opened on
+    /// the main thread; from here on only this thread touches it, keeping
+    /// poppler access sequential.
+    fn spawn(doc: PdfDoc, reply: relm4::Sender<AppMsg>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<RenderJob>();
+        std::thread::spawn(move || {
+            let doc = doc;
+            let mut job = match rx.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            };
+            loop {
+                // Only the newest request matters while scrolling fast.
+                while let Some(newer) = latest_job(&rx) {
+                    job = newer;
+                }
+                let indexes = std::mem::take(&mut job.indexes);
+                let mut superseded = false;
+                for index in indexes {
+                    if let Some(newer) = latest_job(&rx) {
+                        job = newer;
+                        superseded = true;
+                        break;
+                    }
+                    let result = doc
+                        .render_page_bytes(index, job.zoom)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = reply.send(AppMsg::PageRendered {
+                        generation: job.generation,
+                        zoom: job.zoom,
+                        index,
+                        result,
+                    });
+                }
+                if !superseded {
+                    match rx.recv() {
+                        Ok(next) => job = next,
+                        Err(_) => return,
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    fn request(&self, job: RenderJob) {
+        // Unbounded channel: send never blocks the UI thread.
+        let _ = self.tx.send(job);
+    }
+}
+
+/// Drain every queued job, returning the most recent one.
+fn latest_job(rx: &std::sync::mpsc::Receiver<RenderJob>) -> Option<RenderJob> {
+    let mut last = None;
+    while let Ok(job) = rx.try_recv() {
+        last = Some(job);
+    }
+    last
+}
+
 pub struct AppModel {
-    doc: Option<PdfDoc>,
+    /// Owns the document on the renderer thread; `None` until a file opens.
+    renderer: Option<Renderer>,
+    /// Bumped whenever cached textures become invalid (new document, zoom
+    /// change) so late worker replies can be recognized as stale.
+    render_gen: u64,
     path: Option<PathBuf>,
     zoom: f64,
     fit_mode: bool,
@@ -141,6 +220,14 @@ pub enum AppMsg {
     /// (`g 4 2 <Enter>`). Clamped to the document's page count.
     GoToPage(u32),
     ToggleSidebar,
+    /// A renderer-thread page render finished. `gen`/`zoom` tag the batch
+    /// so results from an older document state are dropped on arrival.
+    PageRendered {
+        generation: u64,
+        zoom: f64,
+        index: usize,
+        result: Result<(i32, i32, Vec<u8>), String>,
+    },
     /// Move keyboard focus to the TOC sidebar (Ctrl+h). Never scrolls the
     /// PDF or changes the position highlight.
     FocusSidebar,
@@ -153,7 +240,13 @@ pub enum AppMsg {
 }
 
 impl AppModel {
-    fn load_document(&mut self, widgets: &mut AppModelWidgets, path: PathBuf, doc: PdfDoc) {
+    fn load_document(
+        &mut self,
+        widgets: &mut AppModelWidgets,
+        path: PathBuf,
+        doc: PdfDoc,
+        sender: ComponentSender<Self>,
+    ) {
         // Remember where we were in the document we are leaving, then persist.
         if let (Some(prev), Some(page)) = (self.path.as_ref(), self.current_page()) {
             self.history.borrow_mut().set(prev, page);
@@ -166,11 +259,13 @@ impl AppModel {
         let n_pages = doc.n_pages();
         let sizes_pt: Vec<(f64, f64)> = (0..n_pages).map(|i| doc.page_size(i)).collect();
 
-        self.doc = Some(doc);
+        self.renderer = Some(Renderer::spawn(doc, sender.input_sender().clone()));
         self.path = Some(path.clone());
         self.zoom = 1.0;
         self.last_viewport_width = 0;
         self.page_sizes_pt = sizes_pt;
+        self.render_gen += 1;
+        self.textures.clear();
         self.toc_entries = entries.clone();
         self.highlighted_toc = None;
         self.pinned_toc = None;
@@ -220,10 +315,18 @@ impl AppModel {
         self.persist_config();
     }
 
+    /// Drop all cached page images and tag the next render batch so stale
+    /// worker replies (old zoom or old document) are discarded on arrival.
+    fn invalidate_textures(&mut self) {
+        self.render_gen += 1;
+        self.textures.clear();
+    }
+
     fn rebuild_pages(&mut self) {
         self.pages_box.remove_all();
         self.pictures.clear();
-        self.textures.clear();
+        // New picture widgets: any in-flight reply targets dead indexes.
+        self.invalidate_textures();
 
         for (_width_pt, height_pt) in &self.page_sizes_pt {
             let picture = gtk::Picture::builder()
@@ -257,7 +360,7 @@ impl AppModel {
     /// Recompute the zoom so the widest page spans the content width.
     /// Active while fit mode is on (the default); manual zoom leaves it.
     fn apply_fit_width(&mut self) {
-        if !self.fit_mode || self.doc.is_none() {
+        if !self.fit_mode || self.renderer.is_none() {
             return;
         }
         let width = self.pages_scroller.width();
@@ -274,14 +377,13 @@ impl AppModel {
         self.zoom = (viewport_width / max_width_pt).clamp(0.25, 4.0);
         self.last_viewport_width = width;
         self.resize_pages();
-        self.textures.clear();
+        self.invalidate_textures();
     }
 
-    /// Render every page overlapping the viewport, plus one above and below.
+    /// Ask the renderer thread for every visible page that is not already
+    /// painted, plus one above and below the viewport. Results come back as
+    /// [`AppMsg::PageRendered`].
     fn render_visible(&mut self) {
-        let Some(doc) = self.doc.as_ref() else {
-            return;
-        };
         let adjustment = self.pages_scroller.vadjustment();
         let top = adjustment.value();
         let bottom = top + adjustment.page_size();
@@ -292,19 +394,21 @@ impl AppModel {
             .partition_point(|start| *start < bottom)
             .min(self.pictures.len());
 
-        for index in first..last {
-            if self.textures.contains_key(&index) {
-                continue;
-            }
-            match doc.render_page(index, self.zoom) {
-                Ok(texture) => {
-                    self.pictures[index].set_paintable(Some(&texture));
-                    self.textures.insert(index, texture);
-                }
-                Err(error) => eprintln!("failed to render page {}: {error:#}", index + 1),
-            }
+        let missing: Vec<usize> = (first..last)
+            .filter(|index| !self.textures.contains_key(index))
+            .collect();
+        if !missing.is_empty()
+            && let Some(renderer) = self.renderer.as_ref()
+        {
+            renderer.request(RenderJob {
+                generation: self.render_gen,
+                zoom: self.zoom,
+                indexes: missing,
+            });
         }
 
+        // Keep a small margin of pages around the viewport painted so slow
+        // scrolling does not flash empty gaps.
         self.textures
             .retain(|index, _| index + 4 >= first && *index <= last + 4);
     }
@@ -519,7 +623,8 @@ impl Component for AppModel {
             .build();
 
         let model = AppModel {
-            doc: None,
+            renderer: None,
+            render_gen: 0,
             path: None,
             zoom: 1.0,
             fit_mode: config.borrow().fit_width,
@@ -738,12 +843,12 @@ impl Component for AppModel {
                 // Reloading the same document mid-flight resets the zoom to
                 // 1.0 and rebuilds the pages, so page jumps computed in that
                 // window land on the wrong page. Skip the duplicate.
-                if self.doc.is_some() && self.path.as_deref() == Some(path.as_path()) {
+                if self.renderer.is_some() && self.path.as_deref() == Some(path.as_path()) {
                     return;
                 }
                 match PdfDoc::open(&path) {
                     Ok(doc) => {
-                        self.load_document(widgets, path, doc);
+                        self.load_document(widgets, path, doc, sender.clone());
                         let retry = sender.clone();
                         glib::idle_add_local_once(move || retry.input(AppMsg::ViewportChanged));
                     }
@@ -751,19 +856,19 @@ impl Component for AppModel {
                 }
             }
             AppMsg::ZoomIn => {
-                if self.doc.is_some() {
+                if self.renderer.is_some() {
                     self.set_manual_zoom();
                     self.zoom = (self.zoom * 1.25).min(4.0);
                     self.resize_pages();
-                    self.textures.clear();
+                    self.invalidate_textures();
                 }
             }
             AppMsg::ZoomOut => {
-                if self.doc.is_some() {
+                if self.renderer.is_some() {
                     self.set_manual_zoom();
                     self.zoom = (self.zoom / 1.25).max(0.25);
                     self.resize_pages();
-                    self.textures.clear();
+                    self.invalidate_textures();
                 }
             }
             AppMsg::GoToEntry(index) => {
@@ -809,6 +914,36 @@ impl Component for AppModel {
                 // (content shorter than the viewport) has no room to move.
                 let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
                 adjustment.set_value(max);
+            }
+            AppMsg::PageRendered {
+                generation,
+                zoom,
+                index,
+                result,
+            } => {
+                // Drop replies from an older document state or zoom, and
+                // replies for pictures that were rebuilt meanwhile.
+                if generation != self.render_gen
+                    || zoom != self.zoom
+                    || index >= self.pictures.len()
+                    || self.textures.contains_key(&index)
+                {
+                    return;
+                }
+                match result {
+                    Ok((width, height, bytes)) => {
+                        let texture = gdk::MemoryTexture::new(
+                            width,
+                            height,
+                            gdk::MemoryFormat::B8g8r8a8Premultiplied,
+                            &glib::Bytes::from_owned(bytes),
+                            width as usize * 4,
+                        );
+                        self.pictures[index].set_paintable(Some(&texture));
+                        self.textures.insert(index, texture);
+                    }
+                    Err(error) => eprintln!("failed to render page {}: {error}", index + 1),
+                }
             }
             AppMsg::ToggleSidebar => {
                 let collapsed = !widgets.split_view.is_collapsed();

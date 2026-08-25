@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Yespanda
+GenericName=PDF Reader
+Comment=A keyboard-driven PDF reader
+Exec=/home/void/.local/bin/yespanda %f
+Icon=io.github.yespanda.Yespanda
+Terminal=false
+Categories=Viewer;Office;
+Keywords=pdf;viewer;reader;document;
+MimeType=application/pdf;
+StartupNotify=true
