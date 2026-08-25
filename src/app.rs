@@ -175,12 +175,11 @@ impl AppModel {
         self.pictures.clear();
         self.textures.clear();
 
-        for (width_pt, height_pt) in &self.page_sizes_pt {
-            let picture = gtk::Picture::new();
-            picture.set_size_request(
-                (width_pt * self.zoom).round() as i32,
-                (height_pt * self.zoom).round() as i32,
-            );
+        for (_width_pt, height_pt) in &self.page_sizes_pt {
+            let picture = gtk::Picture::builder()
+                .hexpand(true)
+                .build();
+            picture.set_size_request(0, (height_pt * self.zoom).round() as i32);
             self.pages_box.append(&picture);
             self.pictures.push(picture);
         }
@@ -188,11 +187,8 @@ impl AppModel {
 
     fn resize_pages(&mut self) {
         for (index, picture) in self.pictures.iter().enumerate() {
-            let (width_pt, height_pt) = self.page_sizes_pt[index];
-            picture.set_size_request(
-                (width_pt * self.zoom).round() as i32,
-                (height_pt * self.zoom).round() as i32,
-            );
+            let (_, height_pt) = self.page_sizes_pt[index];
+            picture.set_size_request(0, (height_pt * self.zoom).round() as i32);
         }
     }
 
@@ -523,6 +519,21 @@ impl Component for AppModel {
         widgets
             .split_view
             .set_collapsed(config.borrow().sidebar.collapsed);
+        {
+            let cfg = config.clone();
+            let sv = widgets.split_view.clone();
+            sv.connect_notify_local(Some("show-content"), move |split_view, _| {
+                if !split_view.shows_content() && split_view.is_collapsed() {
+                    let cfg = cfg.clone();
+                    let sv = split_view.clone();
+                    glib::idle_add_local(move || {
+                        sv.set_collapsed(false);
+                        sv.set_sidebar_width_fraction(cfg.borrow().sidebar.width_fraction);
+                        glib::ControlFlow::Break
+                    });
+                }
+            });
+        }
         adw::StyleManager::default().set_color_scheme(config.borrow().theme.into());
 
         // Persist geometry, sidebar state, and the history when the window
