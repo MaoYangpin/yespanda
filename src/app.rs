@@ -385,8 +385,11 @@ pub enum AppMsg {
     PickFile,
     /// Show the search bar and focus its entry (`/`).
     OpenSearch,
-    /// Hide the search bar (Esc or the close button). Matches are kept so
-    /// `n` / `N` keep working until a new document opens.
+    /// Enter in the entry: flush any pending scan, then collapse back to
+    /// the title. Matches stay highlighted for `n` / `N`.
+    SearchConfirm,
+    /// Hide the search bar (Esc). Also clears match highlights and resets
+    /// the input so the next `/` starts fresh.
     CloseSearch,
     /// The query text changed; schedules a debounced scan.
     SearchQuery(String),
@@ -661,6 +664,7 @@ impl AppModel {
         self.view.matches.borrow_mut().clear();
         self.view.current_match.set(None);
         self.match_label.set_label("");
+        self.search_entry.set_text("");
     }
 
     /// Drop results (empty query) without hiding the bar.
@@ -969,7 +973,7 @@ impl Component for AppModel {
             });
             let tx = sender.input_sender().clone();
             search_entry.connect_activate(move |_| {
-                tx.send(AppMsg::SearchNext).ok();
+                tx.send(AppMsg::SearchConfirm).ok();
             });
             let tx = sender.input_sender().clone();
             search_entry.connect_stop_search(move |_| {
@@ -1175,6 +1179,12 @@ impl Component for AppModel {
             let chord_state = chord_state.clone();
             let forward = sender.clone();
             key_controller.connect_key_pressed(move |_, keyval, _, state| {
+                // Esc clears any active search (highlights + input). With
+                // nothing to clear this is a no-op, so other Esc consumers
+                // (sidebar, dialogs) keep working untouched.
+                if keyval == gdk::Key::Escape && state.is_empty() {
+                    forward.input(AppMsg::CloseSearch);
+                }
                 let now = std::time::Instant::now();
                 let mut chord = chord_state.get();
                 if state.is_empty() {
@@ -1391,13 +1401,37 @@ impl Component for AppModel {
                     entry.grab_focus();
                 });
             }
-            AppMsg::CloseSearch => {
-                if !self.search_open {
-                    return;
+            AppMsg::SearchConfirm => {
+                // Enter finalizes the query: if typing settled less than
+                // the debounce ago, run the scan now instead of dropping it.
+                let query = self.search_query.clone();
+                if !query.trim().is_empty() && self.search_debounce.take().is_some() {
+                    sender.input(AppMsg::SearchRun(query));
                 }
+                // Collapse back to the title but KEEP the results: the
+                // highlights stay on screen and n/N keep navigating.
                 self.search_open = false;
                 widgets.header_stack.set_visible_child_name("title");
                 self.pages_scroller.grab_focus();
+            }
+            AppMsg::CloseSearch => {
+                // Runs both for "close the open bar" and for a bare Esc
+                // after Enter-confirmed results: no-op only when there is
+                // neither an open bar nor anything highlighted.
+                if !self.search_open && self.match_total == 0 {
+                    return;
+                }
+                self.search_open = false;
+                if let Some(source) = self.search_debounce.take() {
+                    source.remove();
+                }
+                widgets.header_stack.set_visible_child_name("title");
+                self.pages_scroller.grab_focus();
+                // Esc means "forget this search": drop highlights and the
+                // input text so the next `/` starts fresh.
+                self.clear_matches();
+                self.search_query.clear();
+                self.search_entry.set_text("");
             }
             AppMsg::SearchQuery(text) => {
                 self.search_query = text.clone();
