@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use cairo::{Context as CairoContext, Format, ImageSurface};
 use poppler::{
-    Document,
+    Document, FindFlags,
     ffi::{
         PopplerIndexIter, POPPLER_ACTION_GOTO_DEST, POPPLER_ACTION_NAMED, poppler_action_free,
         poppler_dest_free, poppler_index_iter_free, poppler_index_iter_get_action,
@@ -29,6 +29,16 @@ pub struct TocEntry {
     pub title: String,
     pub page: usize,
     pub depth: usize,
+}
+
+/// A text match on a page, in PDF points with the origin at the top-left
+/// corner of the page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MatchRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
 }
 
 impl PdfDoc {
@@ -143,6 +153,38 @@ impl PdfDoc {
         }
     }
 
+    /// Case-insensitive text search on one page. Returns matches in
+    /// document order, top-left-origin points (see [`MatchRect`]).
+    pub fn find_text(&self, index: usize, needle: &str) -> Vec<MatchRect> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let Some(page) = self.doc.page(index as i32) else {
+            return Vec::new();
+        };
+        // poppler reports rectangles in bottom-left-origin points; flip the
+        // vertical axis so callers can work in widget-like coordinates.
+        let page_height_pt = page.size().1;
+        page.find_text_with_options(needle, FindFlags::DEFAULT)
+            .into_iter()
+            .map(|rect| {
+                let x1 = rect.x1();
+                let y1 = rect.y1();
+                let x2 = rect.x2();
+                let y2 = rect.y2();
+                let y_lo = y1.min(y2);
+                let y_hi = y1.max(y2);
+                MatchRect {
+                    x: x1.min(x2),
+                    y: page_height_pt - y_hi,
+                    w: (x2 - x1).abs(),
+                    h: y_hi - y_lo,
+                }
+            })
+            .filter(|m| m.w > 0.0 && m.h > 0.0)
+            .collect()
+    }
+
     /// Render a page to packed BGRA bytes `(width, height, data)`. Uses only
     /// cairo (no GDK objects), so it is safe to call off the main thread.
     pub fn render_page_bytes(&self, index: usize, zoom: f64) -> Result<(i32, i32, Vec<u8>)> {
@@ -193,6 +235,7 @@ fn glib_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairo::{FontSlant, FontWeight, PdfSurface};
 
     #[test]
     fn outline_structure() {
@@ -243,5 +286,53 @@ mod tests {
             let _ = doc.render_page_bytes(1, 0.5).unwrap();
             drop(doc);
         }
+    }
+
+    /// Build a tiny two-page PDF with known text placement so search
+    /// behavior and match coordinates can be asserted deterministically.
+    fn write_search_fixture(path: &Path) {
+        let surface = PdfSurface::new(595.0, 842.0, path).expect("pdf surface");
+        let ctx = CairoContext::new(&surface).expect("cairo context");
+        ctx.set_source_rgb(1.0, 1.0, 1.0);
+        ctx.paint().unwrap();
+        ctx.select_font_face("Sans", FontSlant::Normal, FontWeight::Normal);
+        ctx.set_font_size(24.0);
+        // Page 1: one match near the top, one near the bottom.
+        ctx.move_to(72.0, 100.0);
+        ctx.show_text("needle at the top").unwrap();
+        ctx.move_to(72.0, 760.0);
+        ctx.show_text("another NEEDLE near the bottom").unwrap();
+        ctx.show_page().unwrap();
+        // Page 2: no matches.
+        ctx.move_to(72.0, 100.0);
+        ctx.show_text("nothing to find here").unwrap();
+        drop(ctx);
+        drop(surface); // flushes the file
+    }
+
+    #[test]
+    fn find_text_finds_and_coordinates_are_top_left() {
+        let path = std::env::temp_dir().join("yespanda-search-fixture.pdf");
+        write_search_fixture(&path);
+
+        let doc = PdfDoc::open(&path).expect("fixture opens");
+        let matches = doc.find_text(0, "needle");
+        assert_eq!(matches.len(), 2, "case-insensitive: both spellings found");
+
+        // Document order: the top occurrence comes first, which also pins
+        // down that y grows downward from the top-left corner (a
+        // bottom-left origin would return ~742 for this rect instead).
+        let top = matches[0];
+        assert!(top.y < 200.0, "first match should be near the top, got {top:?}");
+        assert!((top.x - 72.0).abs() < 5.0, "x starts at the pen position");
+        let bottom = matches[1];
+        assert!(bottom.y > 700.0, "second match should be near the bottom");
+
+        // Whole-word containment across a sentence, and page 2 has none.
+        assert!(doc.find_text(1, "needle").is_empty());
+        assert!(doc.find_text(0, "zzz-absent").is_empty());
+        assert!(doc.find_text(0, "").is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

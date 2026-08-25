@@ -11,7 +11,7 @@ path = "src/main.rs"
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5", "v1_6"] }
 relm4 = { version = "0.11", features = ["libadwaita"] }
 poppler-rs = { version = "0.26", features = ["v22_2"] }
-cairo-rs = "0.22"
+cairo-rs = { version = "0.22", features = ["pdf"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "1"

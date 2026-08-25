@@ -1,19 +1,21 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Condvar, Mutex};
 
 use adw::prelude::*;
 use relm4::gtk::glib;
 use relm4::gtk::glib::clone;
 use relm4::gtk::gdk;
+use relm4::gtk::prelude::{AdjustmentExt, GdkCairoContextExt};
 use relm4::{
     Component, ComponentController, ComponentParts, ComponentSender, Controller,
     RelmRemoveAllExt, adw, gtk,
 };
 
 use crate::config::{Config, History, parse_binding};
-use crate::pdf::{PdfDoc, TocEntry};
+use crate::pdf::{MatchRect, PdfDoc, TocEntry};
 use crate::picker::{PickerDialog, PickerInit, PickerOutput, expand_root};
 use crate::toc::{SidebarBindings, TocInput, TocOutput, TocSidebar};
 
@@ -93,83 +95,210 @@ fn chord_press(
     None
 }
 
-/// One viewport batch of pages to render off the main thread.
+/// One viewport batch of pages to render off the main thread. `order` is
+/// pre-sorted center-out so workers paint the area the reader is looking
+/// at first.
 struct RenderJob {
     generation: u64,
     zoom: f64,
-    indexes: Vec<usize>,
+    order: Vec<usize>,
 }
 
-/// Owns the `PdfDoc` on a worker thread and turns render requests into
-/// [`AppMsg::PageRendered`] replies. Dropping the `Renderer` closes the
-/// channel and ends the thread (the old document is released with it).
+/// Shared work queue for the render pool. Each posted job fully replaces
+/// the previous one (claims included): duplicate concurrent renders of the
+/// same page are harmless because the main thread drops repeats.
+#[derive(Default)]
+struct Pool {
+    inner: Mutex<PoolState>,
+    work_available: Condvar,
+}
+
+#[derive(Default)]
+struct PoolState {
+    job: Option<std::sync::Arc<RenderJob>>,
+    claimed: std::collections::HashSet<usize>,
+    shutdown: bool,
+}
+
+/// Fixed-size pool of renderer threads. Every worker owns its own `PdfDoc`
+/// handle (poppler allows multiple opens of one file), so pages render in
+/// parallel with no locking while a render is running.
 struct Renderer {
-    tx: std::sync::mpsc::Sender<RenderJob>,
+    pool: std::sync::Arc<Pool>,
 }
 
 impl Renderer {
-    /// Hand `doc` over to a fresh worker thread. The document was opened on
-    /// the main thread; from here on only this thread touches it, keeping
-    /// poppler access sequential.
-    fn spawn(doc: PdfDoc, reply: relm4::Sender<AppMsg>) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<RenderJob>();
-        std::thread::spawn(move || {
-            let doc = doc;
-            let mut job = match rx.recv() {
-                Ok(job) => job,
-                Err(_) => return,
-            };
-            loop {
-                // Only the newest request matters while scrolling fast.
-                while let Some(newer) = latest_job(&rx) {
-                    job = newer;
-                }
-                let indexes = std::mem::take(&mut job.indexes);
-                let mut superseded = false;
-                for index in indexes {
-                    if let Some(newer) = latest_job(&rx) {
-                        job = newer;
-                        superseded = true;
-                        break;
-                    }
-                    let result = doc
-                        .render_page_bytes(index, job.zoom)
-                        .map_err(|error| format!("{error:#}"));
-                    let _ = reply.send(AppMsg::PageRendered {
-                        generation: job.generation,
-                        zoom: job.zoom,
-                        index,
-                        result,
-                    });
-                }
-                if !superseded {
-                    match rx.recv() {
-                        Ok(next) => job = next,
-                        Err(_) => return,
-                    }
-                }
-            }
-        });
-        Self { tx }
+    /// Spawn the worker pool for `path`. The already-opened document (if
+    /// any) is handed to the first worker; the rest open their own handle
+    /// lazily on their first job.
+    fn spawn(path: PathBuf, mut leader: Option<PdfDoc>, reply: relm4::Sender<AppMsg>) -> Self {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(1, 4);
+        let pool = std::sync::Arc::new(Pool::default());
+        for worker in 0..threads {
+            let pool = pool.clone();
+            let path = path.clone();
+            let reply = reply.clone();
+            // The main-thread document can only feed ONE worker without
+            // sharing; see the Send note on `PdfDoc`.
+            let doc = if worker == 0 { leader.take() } else { None };
+            std::thread::spawn(move || run_worker(pool, path, doc, reply));
+        }
+        Self { pool }
     }
 
     fn request(&self, job: RenderJob) {
-        // Unbounded channel: send never blocks the UI thread.
-        let _ = self.tx.send(job);
+        let mut state = self.pool.inner.lock().unwrap();
+        state.job = Some(std::sync::Arc::new(job));
+        state.claimed.clear();
+        self.pool.work_available.notify_all();
     }
 }
 
-/// Drain every queued job, returning the most recent one.
-fn latest_job(rx: &std::sync::mpsc::Receiver<RenderJob>) -> Option<RenderJob> {
-    let mut last = None;
-    while let Ok(job) = rx.try_recv() {
-        last = Some(job);
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        let mut state = self.pool.inner.lock().unwrap();
+        state.shutdown = true;
+        state.job = None;
+        self.pool.work_available.notify_all();
     }
-    last
+}
+
+/// Worker body: claim the next unclaimed page of the current job, render
+/// it with this thread's private document handle, and post the result.
+fn run_worker(
+    pool: std::sync::Arc<Pool>,
+    path: PathBuf,
+    doc: Option<PdfDoc>,
+    reply: relm4::Sender<AppMsg>,
+) {
+    let mut doc = doc;
+    let mut open_warned = false;
+    'outer: loop {
+        let (job, index) = {
+            let mut state = pool.inner.lock().unwrap();
+            loop {
+                if state.shutdown {
+                    return;
+                }
+                if let Some(job) = state.job.clone()
+                    && let Some(&index) = job.order.iter().find(|i| !state.claimed.contains(i))
+                {
+                    state.claimed.insert(index);
+                    break (job, index);
+                }
+                state = pool.work_available.wait(state).unwrap();
+            }
+        };
+        if doc.is_none() {
+            match PdfDoc::open(&path) {
+                Ok(opened) => doc = Some(opened),
+                Err(error) => {
+                    if !open_warned {
+                        eprintln!("renderer failed to open {path:?}: {error:#}");
+                        open_warned = true;
+                    }
+                    // Back off instead of spinning; other workers proceed.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue 'outer;
+                }
+            }
+        }
+        let result = doc
+            .as_ref()
+            .unwrap()
+            .render_page_bytes(index, job.zoom)
+            .map_err(|error| format!("{error:#}"));
+        let _ = reply.send(AppMsg::PageRendered {
+            generation: job.generation,
+            zoom: job.zoom,
+            index,
+            result,
+        });
+    }
+}
+
+/// Rendered page image plus a cairo-friendly copy for the draw handler.
+struct PageArt {
+    pixbuf: gdk::gdk_pixbuf::Pixbuf,
+}
+
+/// Paint one page widget: the rendered page (horizontally centered when the
+/// allocation is wider) plus any search highlights on top.
+fn draw_page(
+    _area: &gtk::DrawingArea,
+    cr: &relm4::gtk::cairo::Context,
+    width: i32,
+    height: i32,
+    index: usize,
+    view: &ViewState,
+) {
+    let zoom = view.zoom.get();
+    let textures = view.textures.borrow();
+    if let Some(art) = textures.get(&index) {
+        // The texture was rendered at exactly `zoom` scale, so its size in
+        // logical pixels matches the requested page box; center it when the
+        // allocation is wider (hexpand fills the scroller).
+        let tex_w = art.pixbuf.width() as f64;
+        let tex_h = art.pixbuf.height() as f64;
+        let ox = ((width as f64 - tex_w) / 2.0).max(0.0);
+        let oy = ((height as f64 - tex_h) / 2.0).max(0.0);
+        cr.set_source_pixbuf(&art.pixbuf, ox, oy);
+        let _ = cr.paint();
+
+        // Search highlights on top. The active match gets a stronger fill
+        // and an orange outline; all other hits are a soft yellow wash.
+        let active = view.current_match.get();
+        let rects = view.matches.borrow().get(&index).cloned().unwrap_or_default();
+        for (i, rect) in rects.iter().enumerate() {
+            let x = rect.x * zoom + ox;
+            let y = rect.y * zoom + oy;
+            let w = rect.w * zoom;
+            let h = rect.h * zoom;
+            let is_active = active == Some((index, i));
+            cr.set_source_rgba(1.0, 0.78, 0.1, if is_active { 0.50 } else { 0.28 });
+            cr.rectangle(x, y, w, h);
+            let _ = cr.fill();
+            if is_active {
+                cr.set_source_rgba(0.98, 0.45, 0.05, 0.95);
+                cr.set_line_width(2.0);
+                cr.rectangle(x + 1.0, y + 1.0, w - 2.0, h - 2.0);
+                let _ = cr.stroke();
+            }
+        }
+    }
+}
+
+/// Scan every page of `path` for `query` on a worker thread.
+fn scan_document(path: &Path, n_pages: usize, query: &str) -> HashMap<usize, Vec<MatchRect>> {
+    let Ok(doc) = PdfDoc::open(path) else {
+        return HashMap::new();
+    };
+    let mut hits = HashMap::new();
+    for index in 0..n_pages {
+        let found = doc.find_text(index, query);
+        if !found.is_empty() {
+            hits.insert(index, found);
+        }
+    }
+    hits
+}
+
+#[derive(Default)]
+struct ViewState {
+    textures: RefCell<HashMap<usize, PageArt>>,
+    /// Search hits per page in top-left-origin points (see
+    /// [`MatchRect`]); empty when no search results are shown.
+    matches: RefCell<HashMap<usize, Vec<MatchRect>>>,
+    /// Page + index-within-page of the active match.
+    current_match: Cell<Option<(usize, usize)>>,
+    zoom: Cell<f64>,
 }
 
 pub struct AppModel {
-    /// Owns the document on the renderer thread; `None` until a file opens.
+    /// Owns the document on the renderer threads; `None` until a file opens.
     renderer: Option<Renderer>,
     /// Bumped whenever cached textures become invalid (new document, zoom
     /// change) so late worker replies can be recognized as stale.
@@ -179,11 +308,24 @@ pub struct AppModel {
     fit_mode: bool,
     last_viewport_width: i32,
     page_sizes_pt: Vec<(f64, f64)>,
-    textures: HashMap<usize, gdk::MemoryTexture>,
-    pictures: Vec<gtk::Picture>,
+    /// Textures, search matches, and zoom shared with the page draw
+    /// handlers (all mutated on the main thread only).
+    view: Rc<ViewState>,
+    pages: Vec<gtk::DrawingArea>,
     pages_box: gtk::Box,
     pages_scroller: gtk::ScrolledWindow,
     status_page: adw::StatusPage,
+    /// Search bar state.
+    search_open: bool,
+    search_query: String,
+    /// Bumped per committed query so late scan replies are dropped.
+    search_gen: u64,
+    search_debounce: Option<glib::SourceId>,
+    /// Flattened match count and active index across all pages.
+    match_total: usize,
+    current_flat: usize,
+    /// Shared with the window key controller so bindings stay off while
+    /// the user is typing in the search entry.
     toc_entries: Vec<TocEntry>,
     highlighted_toc: Option<usize>,
     /// Entry highlighted by a sidebar click; kept while the viewport stays
@@ -235,6 +377,22 @@ pub enum AppMsg {
     FocusPdf,
     /// Open the fd+fzf PDF picker dialog.
     PickFile,
+    /// Show the search bar and focus its entry (`/`).
+    OpenSearch,
+    /// Hide the search bar (Esc or the close button). Matches are kept so
+    /// `n` / `N` keep working until a new document opens.
+    CloseSearch,
+    /// The query text changed; schedules a debounced scan.
+    SearchQuery(String),
+    /// Debounced: scan the whole document for the query.
+    SearchRun(String),
+    /// A finished scan's hits, tagged with its generation.
+    SearchResults {
+        generation: u64,
+        hits: HashMap<usize, Vec<MatchRect>>,
+    },
+    SearchNext,
+    SearchPrev,
     /// Result of the picker: `Some(path)` to open, `None` if cancelled.
     PickerResult(Option<PathBuf>),
 }
@@ -259,13 +417,19 @@ impl AppModel {
         let n_pages = doc.n_pages();
         let sizes_pt: Vec<(f64, f64)> = (0..n_pages).map(|i| doc.page_size(i)).collect();
 
-        self.renderer = Some(Renderer::spawn(doc, sender.input_sender().clone()));
+        self.renderer = Some(Renderer::spawn(
+            path.clone(),
+            Some(doc),
+            sender.input_sender().clone(),
+        ));
         self.path = Some(path.clone());
         self.zoom = 1.0;
         self.last_viewport_width = 0;
         self.page_sizes_pt = sizes_pt;
         self.render_gen += 1;
-        self.textures.clear();
+        self.view.textures.borrow_mut().clear();
+        // A new document invalidates any running search completely.
+        self.reset_search(widgets);
         self.toc_entries = entries.clone();
         self.highlighted_toc = None;
         self.pinned_toc = None;
@@ -319,35 +483,42 @@ impl AppModel {
     /// worker replies (old zoom or old document) are discarded on arrival.
     fn invalidate_textures(&mut self) {
         self.render_gen += 1;
-        self.textures.clear();
+        self.view.textures.borrow_mut().clear();
+        for page in &self.pages {
+            page.queue_draw();
+        }
     }
 
     fn rebuild_pages(&mut self) {
         self.pages_box.remove_all();
-        self.pictures.clear();
-        // New picture widgets: any in-flight reply targets dead indexes.
+        self.pages.clear();
+        // New widgets: any in-flight reply targets dead indexes.
         self.invalidate_textures();
 
-        for (_width_pt, height_pt) in &self.page_sizes_pt {
-            let picture = gtk::Picture::builder()
-                .hexpand(true)
-                .build();
-            picture.set_size_request(0, (height_pt * self.zoom).round() as i32);
-            self.pages_box.append(&picture);
-            self.pictures.push(picture);
+        for (index, (_width_pt, height_pt)) in self.page_sizes_pt.iter().enumerate() {
+            let area = gtk::DrawingArea::builder().hexpand(true).build();
+            area.set_size_request(0, (height_pt * self.zoom).round() as i32);
+            let view = self.view.clone();
+            area.set_draw_func(move |area, cr, width, height| {
+                draw_page(area, cr, width, height, index, &view);
+            });
+            self.pages_box.append(&area);
+            self.pages.push(area);
         }
     }
 
     fn resize_pages(&mut self) {
-        for (index, picture) in self.pictures.iter().enumerate() {
+        self.view.zoom.set(self.zoom);
+        for (index, page) in self.pages.iter().enumerate() {
             let (_, height_pt) = self.page_sizes_pt[index];
-            picture.set_size_request(0, (height_pt * self.zoom).round() as i32);
+            page.set_size_request(0, (height_pt * self.zoom).round() as i32);
+            page.queue_draw();
         }
     }
 
     /// Top-edge pixel offset of every page at the current zoom.
     fn offsets(&self) -> Vec<f64> {
-        let mut offsets = Vec::with_capacity(self.pictures.len());
+        let mut offsets = Vec::with_capacity(self.pages.len());
         let mut cursor = 0.0;
         for (_, height_pt) in &self.page_sizes_pt {
             offsets.push(cursor);
@@ -380,9 +551,9 @@ impl AppModel {
         self.invalidate_textures();
     }
 
-    /// Ask the renderer thread for every visible page that is not already
-    /// painted, plus one above and below the viewport. Results come back as
-    /// [`AppMsg::PageRendered`].
+    /// Ask the renderer pool for every visible page that is not already
+    /// painted, plus a small prefetch margin above and below. Results come
+    /// back as [`AppMsg::PageRendered`].
     fn render_visible(&mut self) {
         let adjustment = self.pages_scroller.vadjustment();
         let top = adjustment.value();
@@ -392,24 +563,39 @@ impl AppModel {
         let first = offsets.partition_point(|start| *start < top - PAGE_SPACING as f64);
         let last = offsets
             .partition_point(|start| *start < bottom)
-            .min(self.pictures.len());
+            .min(self.pages.len());
 
+        // Prefetch two pages past each edge so slow scrolling mostly hits
+        // the texture cache instead of waiting on a render round trip.
+        const PREFETCH: usize = 2;
+        let first = first.saturating_sub(PREFETCH);
+        let last = (last + PREFETCH).min(self.pages.len());
+
+        let textures = self.view.textures.borrow();
         let missing: Vec<usize> = (first..last)
-            .filter(|index| !self.textures.contains_key(index))
+            .filter(|index| !textures.contains_key(index))
             .collect();
+        drop(textures);
         if !missing.is_empty()
             && let Some(renderer) = self.renderer.as_ref()
         {
+            // Paint outward from the viewport center so the area under the
+            // reader's eyes appears first, regardless of scroll direction.
+            let center = (first + last) / 2;
+            let mut order = missing;
+            order.sort_by_key(|index| index.abs_diff(center));
             renderer.request(RenderJob {
                 generation: self.render_gen,
                 zoom: self.zoom,
-                indexes: missing,
+                order,
             });
         }
 
         // Keep a small margin of pages around the viewport painted so slow
         // scrolling does not flash empty gaps.
-        self.textures
+        self.view
+            .textures
+            .borrow_mut()
             .retain(|index, _| index + 4 >= first && *index <= last + 4);
     }
 
@@ -453,15 +639,154 @@ impl AppModel {
         self.scroll_to_page(page);
     }
 
+    // ---- search ---------------------------------------------------------
+
+    /// Forget everything about the current search (document switch).
+    fn reset_search(&mut self, widgets: &mut AppModelWidgets) {
+        if let Some(source) = self.search_debounce.take() {
+            source.remove();
+        }
+        self.search_open = false;
+        widgets.search_bar.set_search_mode(false);
+        self.search_query.clear();
+        self.search_gen += 1;
+        self.match_total = 0;
+        self.current_flat = 0;
+        self.view.matches.borrow_mut().clear();
+        self.view.current_match.set(None);
+        widgets.match_label.set_label("");
+    }
+
+    /// Drop results (empty query) without hiding the bar.
+    fn clear_matches(&mut self, widgets: &mut AppModelWidgets) {
+        let redrawn: Vec<usize> = self.view.matches.borrow().keys().copied().collect();
+        self.view.matches.borrow_mut().clear();
+        self.view.current_match.set(None);
+        self.match_total = 0;
+        self.current_flat = 0;
+        widgets.match_label.set_label("");
+        for index in redrawn {
+            if let Some(page) = self.pages.get(index) {
+                page.queue_draw();
+            }
+        }
+    }
+
+    /// Install fresh scan results, select the first match and jump to it.
+    fn apply_search_results(
+        &mut self,
+        hits: HashMap<usize, Vec<MatchRect>>,
+        widgets: &mut AppModelWidgets,
+    ) {
+        let previous: Vec<usize> = self.view.matches.borrow().keys().copied().collect();
+        let total: usize = hits.values().map(|rects| rects.len()).sum();
+        *self.view.matches.borrow_mut() = hits;
+
+        let first = if total > 0 { Some((0, 0)) } else { None };
+        self.view.current_match.set(first);
+        self.match_total = total;
+        self.current_flat = 0;
+        let label = if total > 0 {
+            format!("1/{total}")
+        } else {
+            "No matches".to_string()
+        };
+        widgets.match_label.set_label(&label);
+
+        for index in previous.iter().copied().chain(self.view.matches.borrow().keys().copied()) {
+            if let Some(page) = self.pages.get(index) {
+                page.queue_draw();
+            }
+        }
+        if let Some((page, index_in_page)) = first {
+            let rect = {
+                let matches = self.view.matches.borrow();
+                matches
+                    .get(&page)
+                    .and_then(|rects| rects.get(index_in_page))
+                    .copied()
+            };
+            if let Some(rect) = rect {
+                self.scroll_to_match(page, rect);
+            }
+        }
+    }
+
+    /// Move the active match by `delta` (wrapping) and scroll to it.
+    fn step_match(&mut self, delta: isize, widgets: &mut AppModelWidgets) {
+        if self.match_total == 0 {
+            return;
+        }
+        let total = self.match_total as isize;
+        let next = (self.current_flat as isize + delta).rem_euclid(total) as usize;
+        let Some((page, index_in_page)) = self.nth_match(next) else {
+            return;
+        };
+        let old_current = self.view.current_match.get();
+        self.view.current_match.set(Some((page, index_in_page)));
+        self.current_flat = next;
+        widgets
+            .match_label
+            .set_label(&format!("{}/{}", next + 1, self.match_total));
+        // Redraw only the two affected pages.
+        let mut redraw = Vec::new();
+        if let Some((p, _)) = old_current {
+            redraw.push(p);
+        }
+        redraw.push(page);
+        for p in redraw {
+            if let Some(area) = self.pages.get(p) {
+                area.queue_draw();
+            }
+        }
+        let rect = {
+            let matches = self.view.matches.borrow();
+            matches
+                .get(&page)
+                .and_then(|rects| rects.get(index_in_page))
+                .copied()
+        };
+        if let Some(rect) = rect {
+            self.scroll_to_match(page, rect);
+        }
+    }
+
+    /// Flattened `n`-th match across pages in ascending order.
+    fn nth_match(&self, n: usize) -> Option<(usize, usize)> {
+        let matches = self.view.matches.borrow();
+        let mut walked = 0usize;
+        for page in 0..self.pages.len() {
+            let count = matches.get(&page).map_or(0, |rects| rects.len());
+            if n < walked + count {
+                return Some((page, n - walked));
+            }
+            walked += count;
+        }
+        None
+    }
+
+    /// Vertically center-ish a match rect in the viewport.
+    fn scroll_to_match(&mut self, page: usize, rect: MatchRect) {
+        let offsets = self.offsets();
+        let Some(offset) = offsets.get(page).copied() else {
+            return;
+        };
+        let adjustment = self.pages_scroller.vadjustment();
+        let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        let target = offset + rect.y * self.zoom - adjustment.page_size() * 0.35;
+        adjustment.set_value(target.clamp(adjustment.lower(), max));
+    }
+
     /// Index of the page under the viewport's vertical centre.
-    fn current_page(&self) -> Option<usize> {        if self.pictures.is_empty() {
+    fn current_page(&self) -> Option<usize> {
+        if self.pages.is_empty() {
             return None;
         }
         let adjustment = self.pages_scroller.vadjustment();
         let centre = adjustment.value() + adjustment.page_size() / 2.0;
         let offsets = self.offsets();
         let page = offsets.partition_point(|start| *start <= centre).max(1) - 1;
-        Some(page.min(self.pictures.len() - 1))
+        Some(page.min(self.pages.len() - 1))
     }
 
     /// Push the hover-highlight to the sidebar entry covering the visible
@@ -502,7 +827,7 @@ impl AppModel {
     }
 
     fn scroll_to_page(&mut self, page: usize) {
-        if page >= self.pictures.len() {
+        if page >= self.pages.len() {
             return;
         }
         let offsets = self.offsets();
@@ -573,10 +898,39 @@ impl Component for AppModel {
                                 set_title: "No document",
                             },
                         },
-                        #[name = "content_stack"]
                         #[wrap(Some)]
-                        set_content = &gtk::Stack {
-                            set_transition_type: gtk::StackTransitionType::Crossfade,
+                        set_content = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            append: search_bar = &gtk::SearchBar {
+                                set_show_close_button: true,
+                                #[wrap(Some)]
+                                set_child = &gtk::Box {
+                                    set_spacing: 8,
+                                    set_margin_start: 8,
+                                    set_margin_end: 8,
+                                    append: search_entry = &gtk::SearchEntry {
+                                        set_hexpand: true,
+                                        set_placeholder_text: Some("Find in document…"),
+                                        connect_changed[sender] => move |entry| {
+                                            sender.input(AppMsg::SearchQuery(entry.text().into()));
+                                        },
+                                        connect_activate[sender] => move |_entry| {
+                                            sender.input(AppMsg::SearchNext);
+                                        },
+                                        connect_stop_search[sender] => move |_entry| {
+                                            sender.input(AppMsg::CloseSearch);
+                                        },
+                                    },
+                                    append: match_label = &gtk::Label {
+                                        set_valign: gtk::Align::Center,
+                                        set_width_chars: 10,
+                                    },
+                                },
+                            },
+                            append: content_stack = &gtk::Stack {
+                                set_vexpand: true,
+                                set_transition_type: gtk::StackTransitionType::Crossfade,
+                            },
                         },
                     },
                 },
@@ -622,6 +976,8 @@ impl Component for AppModel {
             .description("Start yespanda with a PDF file to view it.")
             .build();
 
+        let view = Rc::new(ViewState::default());
+
         let model = AppModel {
             renderer: None,
             render_gen: 0,
@@ -630,11 +986,17 @@ impl Component for AppModel {
             fit_mode: config.borrow().fit_width,
             last_viewport_width: 0,
             page_sizes_pt: Vec::new(),
-            textures: HashMap::new(),
-            pictures: Vec::new(),
+            view: view.clone(),
+            pages: Vec::new(),
             pages_box: pages_box.clone(),
             pages_scroller: pages_scroller.clone(),
             status_page: status_page.clone(),
+            search_open: false,
+            search_query: String::new(),
+            search_gen: 0,
+            search_debounce: None,
+            match_total: 0,
+            current_flat: 0,
             toc_entries: Vec::new(),
             highlighted_toc: None,
             pinned_toc: None,
@@ -648,6 +1010,20 @@ impl Component for AppModel {
         };
 
         let widgets = view_output!();
+
+        // The search bar's close button toggles search-mode directly; route
+        // that through CloseSearch so the model stays in sync.
+        {
+            let tx = sender.input_sender().clone();
+            widgets.search_bar.connect_notify_local(
+                Some("search-mode-enabled"),
+                move |bar, _| {
+                    if !bar.is_search_mode() {
+                        tx.send(AppMsg::CloseSearch).ok();
+                    }
+                },
+            );
+        }
 
         // Focus the PDF content once the window maps, so j/k/h/l scroll the
         // document instead of navigating the sidebar right after startup.
@@ -756,6 +1132,9 @@ impl Component for AppModel {
             (AppMsg::ZoomIn, &keymap.zoom_in),
             (AppMsg::ZoomOut, &keymap.zoom_out),
             (AppMsg::PickFile, &keymap.pick_file),
+            (AppMsg::OpenSearch, &keymap.search),
+            (AppMsg::SearchNext, &keymap.search_next),
+            (AppMsg::SearchPrev, &keymap.search_prev),
         ]
         .into_iter()
         .filter_map(|(msg, spec)| parse_binding(spec).map(|(mods, key)| (msg, mods, key)))
@@ -886,7 +1265,7 @@ impl Component for AppModel {
                 // 1-based as typed; `scroll_to_page` ignores out-of-range
                 // pages, so clamping is all that is needed here.
                 let index = (page as usize).saturating_sub(1);
-                if index < self.pictures.len() {
+                if index < self.pages.len() {
                     self.scroll_to_page(index);
                 }
             }
@@ -922,11 +1301,11 @@ impl Component for AppModel {
                 result,
             } => {
                 // Drop replies from an older document state or zoom, and
-                // replies for pictures that were rebuilt meanwhile.
+                // replies for pages that were rebuilt meanwhile.
                 if generation != self.render_gen
                     || zoom != self.zoom
-                    || index >= self.pictures.len()
-                    || self.textures.contains_key(&index)
+                    || index >= self.pages.len()
+                    || self.view.textures.borrow().contains_key(&index)
                 {
                     return;
                 }
@@ -939,8 +1318,12 @@ impl Component for AppModel {
                             &glib::Bytes::from_owned(bytes),
                             width as usize * 4,
                         );
-                        self.pictures[index].set_paintable(Some(&texture));
-                        self.textures.insert(index, texture);
+                        let pixbuf = gdk::pixbuf_get_from_texture(&texture)
+                            .expect("texture to pixbuf conversion");
+                        self.view.textures.borrow_mut().insert(index, PageArt { pixbuf });
+                        if let Some(page) = self.pages.get(index) {
+                            page.queue_draw();
+                        }
                     }
                     Err(error) => eprintln!("failed to render page {}: {error}", index + 1),
                 }
@@ -993,6 +1376,66 @@ impl Component for AppModel {
                     sender.input(AppMsg::OpenFile(uri));
                 }
             }
+            AppMsg::OpenSearch => {
+                self.search_open = true;
+                widgets.search_bar.set_search_mode(true);
+                let entry = widgets.search_entry.clone();
+                glib::idle_add_local_once(move || {
+                    entry.grab_focus();
+                });
+            }
+            AppMsg::CloseSearch => {
+                if !self.search_open {
+                    return;
+                }
+                self.search_open = false;
+                widgets.search_bar.set_search_mode(false);
+                self.pages_scroller.grab_focus();
+            }
+            AppMsg::SearchQuery(text) => {
+                self.search_query = text.clone();
+                if let Some(source) = self.search_debounce.take() {
+                    source.remove();
+                }
+                // Empty query clears results immediately; otherwise wait
+                // for typing to settle before scanning the whole document.
+                if text.trim().is_empty() {
+                    self.clear_matches(widgets);
+                    return;
+                }
+                let tx = sender.input_sender().clone();
+                self.search_debounce = Some(glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(250),
+                    move || {
+                        tx.send(AppMsg::SearchRun(text)).ok();
+                    },
+                ));
+            }
+            AppMsg::SearchRun(query) => {
+                self.search_debounce = None;
+                let Some(path) = self.path.clone() else {
+                    return;
+                };
+                let n_pages = self.pages.len();
+                if n_pages == 0 {
+                    return;
+                }
+                self.search_gen += 1;
+                let generation = self.search_gen;
+                let tx = sender.input_sender().clone();
+                std::thread::spawn(move || {
+                    let hits = scan_document(&path, n_pages, &query);
+                    let _ = tx.send(AppMsg::SearchResults { generation, hits });
+                });
+            }
+            AppMsg::SearchResults { generation, hits } => {
+                if generation != self.search_gen {
+                    return;
+                }
+                self.apply_search_results(hits, widgets);
+            }
+            AppMsg::SearchNext => self.step_match(1, widgets),
+            AppMsg::SearchPrev => self.step_match(-1, widgets),
         }
         self.update_view(widgets, sender);
     }

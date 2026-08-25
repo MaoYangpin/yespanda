@@ -30,6 +30,7 @@ pub fn parse_binding(spec: &str) -> Option<(gdk::ModifierType, gdk::Key)> {
                         "plus" => "+",
                         "minus" => "-",
                         "equal" => "=",
+                        "slash" => "/",
                         _ => return None,
                     })
                 });
@@ -149,6 +150,15 @@ pub struct KeymapConfig {
     /// Jump to the end of the document (Shift+G).
     #[serde(default = "key_default_scroll_bottom")]
     pub scroll_bottom: String,
+    /// Open the in-document search bar (`/`).
+    #[serde(default = "key_default_search")]
+    pub search: String,
+    /// Jump to the next match while a search is active (`n`).
+    #[serde(default = "key_default_search_next")]
+    pub search_next: String,
+    /// Jump to the previous match while a search is active (`N`).
+    #[serde(default = "key_default_search_prev")]
+    pub search_prev: String,
     /// Two-key chord: `<leader> <key>` toggles the sidebar.
     #[serde(default = "key_default_sidebar_toggle")]
     pub sidebar_toggle: String,
@@ -196,6 +206,9 @@ key_default!(key_default_scroll_left, "h");
 key_default!(key_default_scroll_right, "l");
 key_default!(key_default_scroll_top, "g g");
 key_default!(key_default_scroll_bottom, "shift G");
+key_default!(key_default_search, "slash");
+key_default!(key_default_search_next, "n");
+key_default!(key_default_search_prev, "shift N");
 key_default!(key_default_sidebar_toggle, "space e");
 key_default!(key_default_sidebar_down, "j");
 key_default!(key_default_sidebar_up, "k");
@@ -217,6 +230,9 @@ impl Default for KeymapConfig {
             scroll_right: "l".into(),
             scroll_top: "g g".into(),
             scroll_bottom: "shift G".into(),
+            search: "slash".into(),
+            search_next: "n".into(),
+            search_prev: "shift N".into(),
             sidebar_toggle: "space e".into(),
             sidebar_down: "j".into(),
             sidebar_up: "k".into(),
@@ -411,6 +427,19 @@ mod tests {
         assert_eq!(leader, Some(gdk::Key::g));
         assert_eq!(completer, Some(gdk::Key::g));
         assert!(tokens.next().is_none());
+        // Search bindings: `/` opens, `n` next, Shift+N previous.
+        assert_eq!(
+            parse_binding(&keymap.search),
+            Some((gdk::ModifierType::empty(), gdk::Key::slash))
+        );
+        assert_eq!(
+            parse_binding(&keymap.search_next),
+            Some((gdk::ModifierType::empty(), gdk::Key::n))
+        );
+        assert_eq!(
+            parse_binding(&keymap.search_prev),
+            Some((gdk::ModifierType::SHIFT_MASK, gdk::Key::N))
+        );
         assert_eq!(parse_binding("bogus_key"), None);
         assert_eq!(parse_binding(""), None);
     }
