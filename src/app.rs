@@ -451,11 +451,6 @@ impl AppModel {
         // until the viewport is scrolled.
         self.pages_scroller.vadjustment().set_value(0.0);
 
-        if let Some(path) = path.to_str() {
-            self.config.borrow_mut().last_file = Some(path.to_owned());
-            self.persist_config();
-        }
-
         let name = self
             .path
             .as_ref()
@@ -1210,9 +1205,9 @@ impl Component for AppModel {
         }
         root.add_controller(key_controller);
 
-        // Reopen the PDF viewed in the previous session.
-        if let Some(path) = config.borrow().last_file.clone() {
-            sender.input(AppMsg::OpenFile(path));
+        // Reopen the most recently viewed PDF (newest history entry).
+        if let Some(path) = model.history.borrow().most_recent().map(Path::to_path_buf) {
+            sender.input(AppMsg::OpenFile(path.to_string_lossy().into_owned()));
         }
 
         ComponentParts { model, widgets }
@@ -1235,7 +1230,7 @@ impl Component for AppModel {
                 // so the newly opened document is immediately visible.
                 self.window.present();
                 // A file can arrive twice: once from the command line / gio
-                // open, and again from the saved `last_file` on startup.
+                // open, and again from the history reopen on startup.
                 // Reloading the same document mid-flight resets the zoom to
                 // 1.0 and rebuilds the pages, so page jumps computed in that
                 // window land on the wrong page. Skip the duplicate.

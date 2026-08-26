@@ -51,9 +51,6 @@ pub struct Config {
     pub window: WindowConfig,
     #[serde(default)]
     pub sidebar: SidebarConfig,
-    /// PDF opened last session; reopened on the next launch.
-    #[serde(default)]
-    pub last_file: Option<String>,
     /// Whether fit-to-width is the default viewing mode.
     #[serde(default)]
     pub fit_width: bool,
@@ -262,7 +259,6 @@ impl Default for Config {
         Self {
             window: WindowConfig::default(),
             sidebar: SidebarConfig::default(),
-            last_file: None,
             fit_width: true,
             theme: ThemePreference::System,
             keymap: KeymapConfig::default(),
@@ -361,6 +357,12 @@ impl History {
             .iter()
             .find(|(entry, _)| entry == path)
             .map(|(_, page)| *page)
+    }
+
+    /// Most recently opened document (the file is written newest-first,
+    /// so this is the first entry).
+    pub fn most_recent(&self) -> Option<&Path> {
+        self.entries.first().map(|(path, _)| path.as_path())
     }
 
     /// Record the position for `path`, moving it to the front.
