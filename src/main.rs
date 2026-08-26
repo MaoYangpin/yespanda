@@ -1,5 +1,7 @@
 mod app;
 mod config;
+mod notes;
+mod notes_dialog;
 mod pdf;
 mod picker;
 mod toc;

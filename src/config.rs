@@ -156,6 +156,12 @@ pub struct KeymapConfig {
     /// Jump to the previous match while a search is active (`N`).
     #[serde(default = "key_default_search_prev")]
     pub search_prev: String,
+    /// Add a margin note anchored at the viewport center (`m`).
+    #[serde(default = "key_default_note_add")]
+    pub note_add: String,
+    /// Browse the current document's notes (`M`).
+    #[serde(default = "key_default_note_list")]
+    pub note_list: String,
     /// Two-key chord: `<leader> <key>` toggles the sidebar.
     #[serde(default = "key_default_sidebar_toggle")]
     pub sidebar_toggle: String,
@@ -206,6 +212,8 @@ key_default!(key_default_scroll_bottom, "shift G");
 key_default!(key_default_search, "slash");
 key_default!(key_default_search_next, "n");
 key_default!(key_default_search_prev, "shift N");
+key_default!(key_default_note_add, "m");
+key_default!(key_default_note_list, "shift M");
 key_default!(key_default_sidebar_toggle, "space e");
 key_default!(key_default_sidebar_down, "j");
 key_default!(key_default_sidebar_up, "k");
@@ -230,6 +238,8 @@ impl Default for KeymapConfig {
             search: "slash".into(),
             search_next: "n".into(),
             search_prev: "shift N".into(),
+            note_add: "m".into(),
+            note_list: "shift M".into(),
             sidebar_toggle: "space e".into(),
             sidebar_down: "j".into(),
             sidebar_up: "k".into(),
@@ -448,6 +458,14 @@ mod tests {
         assert_eq!(
             parse_binding(&keymap.search_prev),
             Some((gdk::ModifierType::SHIFT_MASK, gdk::Key::N))
+        );
+        assert_eq!(
+            parse_binding(&keymap.note_add),
+            Some((gdk::ModifierType::empty(), gdk::Key::m))
+        );
+        assert_eq!(
+            parse_binding(&keymap.note_list),
+            Some((gdk::ModifierType::SHIFT_MASK, gdk::Key::M))
         );
         assert_eq!(parse_binding("bogus_key"), None);
         assert_eq!(parse_binding(""), None);

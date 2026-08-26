@@ -16,6 +16,10 @@ use relm4::{
 
 use crate::config::{Config, History, parse_binding};
 use crate::pdf::{MatchRect, PdfDoc, TocEntry};
+use crate::notes::Notes;
+use crate::notes_dialog::{
+    NotesList, NotesListInit, NotesListInput, NotesListItem, NotesListOutput,
+};
 use crate::picker::{PickerDialog, PickerInit, PickerOutput, expand_root};
 use crate::toc::{SidebarBindings, TocInput, TocOutput, TocSidebar};
 
@@ -248,6 +252,30 @@ fn draw_page(
         cr.set_source_pixbuf(&art.pixbuf, ox, oy);
         let _ = cr.paint();
 
+        // Note markers: slim blue tabs on the page's right edge, one per
+        // note anchored on this page.
+        {
+            let marks = view.note_marks.borrow().get(&index).cloned();
+            if let Some(fracs) = marks
+                && let Some(art) = textures.get(&index)
+            {
+                let tex_w = art.pixbuf.width() as f64;
+                let tex_h = art.pixbuf.height() as f64;
+                let ox = ((width as f64 - tex_w) / 2.0).max(0.0);
+                let oy = ((height as f64 - tex_h) / 2.0).max(0.0);
+                let right = ox + tex_w;
+                cr.set_source_rgba(0.20, 0.55, 0.95, 0.90);
+                for frac in fracs {
+                    let y = oy + frac * tex_h;
+                    cr.move_to(right - 9.0, y - 7.0);
+                    cr.line_to(right, y);
+                    cr.line_to(right - 9.0, y + 7.0);
+                    cr.close_path();
+                    let _ = cr.fill();
+                }
+            }
+        }
+
         // Search highlights on top. The active match gets a stronger fill
         // and an orange outline; all other hits are a soft yellow wash.
         let active = view.current_match.get();
@@ -292,6 +320,9 @@ struct ViewState {
     /// Search hits per page in top-left-origin points (see
     /// [`MatchRect`]); empty when no search results are shown.
     matches: RefCell<HashMap<usize, Vec<MatchRect>>>,
+    /// Note anchor positions per 0-based page index, each a fraction of
+    /// the page height; drives the blue edge tabs.
+    note_marks: RefCell<HashMap<usize, Vec<f64>>>,
     /// Page + index-within-page of the active match.
     current_match: Cell<Option<(usize, usize)>>,
     zoom: Cell<f64>,
@@ -347,6 +378,18 @@ pub struct AppModel {
     window: gtk::Window,
     toc: Controller<TocSidebar>,
     picker: Option<Controller<PickerDialog>>,
+    /// All saved notes across documents (write-through on changes).
+    notes: Rc<RefCell<Notes>>,
+    /// Top-right overlay card hosting the note text editor.
+    editor_slot: gtk::Box,
+    editor_heading: gtk::Label,
+    editor_text: gtk::TextView,
+    /// Anchor frozen when the editor was opened: (page 0-based, y_frac).
+    pending_note_anchor: Option<(usize, f64)>,
+    /// Set while revising an existing note instead of creating one.
+    editing_note_id: Option<u64>,
+    /// Persistent notes browser for the current document.
+    notes_list: Controller<NotesList>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -402,6 +445,16 @@ pub enum AppMsg {
     },
     SearchNext,
     SearchPrev,
+    /// Add a margin note anchored at the viewport center (`m`).
+    AddNote,
+    /// Browse the current document's notes (`M`).
+    BrowseNotes,
+    /// Editor finished: `Some(text)` saved, `None` discarded.
+    NoteEdited(Option<String>),
+    /// Browser asks to jump to a note's anchor.
+    JumpToNote(u64),
+    /// Browser deleted a note.
+    NoteDeleted(u64),
     /// Result of the picker: `Some(path)` to open, `None` if cancelled.
     PickerResult(Option<PathBuf>),
 }
@@ -443,6 +496,7 @@ impl AppModel {
         self.highlighted_toc = None;
         self.pinned_toc = None;
         self.pending_restore = self.history.borrow().page_for(&path);
+        self.rebuild_note_marks();
         self.rebuild_pages();
 
         // Reset the scroll position to the top. Otherwise the stale scroll
@@ -645,6 +699,83 @@ impl AppModel {
 
     // ---- search ---------------------------------------------------------
 
+    // ---- notes ----------------------------------------------------------
+
+    /// Recompute per-page note anchor fractions for the open document.
+    fn rebuild_note_marks(&mut self) {
+        let mut marks: HashMap<usize, Vec<f64>> = HashMap::new();
+        if let Some(path) = self.path.as_ref() {
+            for note in self.notes.borrow().for_doc(path) {
+                if note.page >= 1
+                    && let Some(slot) =
+                        marks.get_mut(&(note.page - 1))
+                {
+                    slot.push(note.y_frac);
+                    continue;
+                }
+                marks.entry(note.page - 1).or_default().push(note.y_frac);
+            }
+        }
+        for fracs in marks.values_mut() {
+            fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        *self.view.note_marks.borrow_mut() = marks;
+    }
+
+    /// (page 0-based, fraction down that page) of the viewport center —
+    /// the anchor a new note gets when `m` is pressed.
+    fn note_anchor_at_center(&self) -> Option<(usize, f64)> {
+        let page = self.current_page()?;
+        let offsets = self.offsets();
+        let adjustment = self.pages_scroller.vadjustment();
+        let center = adjustment.value() + adjustment.page_size() / 2.0;
+        let top = *offsets.get(page)?;
+        let (_, height_pt) = self.page_sizes_pt.get(page).copied()?;
+        let frac = ((center - top) / (height_pt * self.zoom)).clamp(0.0, 1.0);
+        Some((page, frac))
+    }
+
+    /// Scroll so that `y_frac` of `page` sits in the upper third of the
+    /// viewport. Also drives prefetch renders via value_changed.
+    fn scroll_to_offset(&mut self, page: usize, y_frac: f64) {
+        let offsets = self.offsets();
+        let Some(offset) = offsets.get(page).copied() else {
+            return;
+        };
+        let height_pt = self.page_sizes_pt.get(page).map(|(_, h)| *h).unwrap_or(0.0);
+        let adjustment = self.pages_scroller.vadjustment();
+        let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        let target = offset + y_frac * height_pt * self.zoom - adjustment.page_size() * 0.35;
+        adjustment.set_value(target.clamp(adjustment.lower(), max));
+    }
+
+    /// Refresh and present the notes browser for the open document.
+    fn show_notes_list(&mut self) {
+        let items: Vec<NotesListItem> = self
+            .path
+            .as_ref()
+            .map(|path| {
+                self.notes
+                    .borrow()
+                    .for_doc(path)
+                    .iter()
+                    .map(|note| NotesListItem {
+                        id: note.id,
+                        title: note.text.lines().next().unwrap_or("").to_string(),
+                        subtitle: format!(
+                            "p.{} · {}% · {}",
+                            note.page,
+                            (note.y_frac * 100.0).round() as i32,
+                            note.created
+                        ),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.notes_list.emit(NotesListInput::Update(items));
+        self.notes_list.emit(NotesListInput::Show);
+    }
+
     /// Forget everything about the current search (document switch).
     fn reset_search(&mut self, widgets: &mut AppModelWidgets) {
         if let Some(source) = self.search_debounce.take() {
@@ -767,14 +898,8 @@ impl AppModel {
 
     /// Vertically center-ish a match rect in the viewport.
     fn scroll_to_match(&mut self, page: usize, rect: MatchRect) {
-        let offsets = self.offsets();
-        let Some(offset) = offsets.get(page).copied() else {
-            return;
-        };
-        let adjustment = self.pages_scroller.vadjustment();
-        let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
-        let target = offset + rect.y * self.zoom - adjustment.page_size() * 0.35;
-        adjustment.set_value(target.clamp(adjustment.lower(), max));
+        let height_pt = self.page_sizes_pt.get(page).map(|(_, h)| *h).unwrap_or(1.0);
+        self.scroll_to_offset(page, rect.y / height_pt);
     }
 
     /// Index of the page under the viewport's vertical centre.
@@ -903,9 +1028,12 @@ impl Component for AppModel {
                             },
                         },
                         #[wrap(Some)]
-                        set_content = content_stack = &gtk::Stack {
-                            set_vexpand: true,
-                            set_transition_type: gtk::StackTransitionType::Crossfade,
+                        set_content = content_overlay = &gtk::Overlay {
+                            #[wrap(Some)]
+                            set_child = content_stack = &gtk::Stack {
+                                set_vexpand: true,
+                                set_transition_type: gtk::StackTransitionType::Crossfade,
+                            },
                         },
                     },
                 },
@@ -981,8 +1109,18 @@ impl Component for AppModel {
             .build();
 
         let view = Rc::new(ViewState::default());
+        let notes = Rc::new(RefCell::new(Notes::load()));
+        let notes_list = NotesList::builder()
+            .launch(NotesListInit {
+                parent: root.clone().upcast::<gtk::Window>(),
+            })
+            .forward(sender.input_sender(), |out| match out {
+                NotesListOutput::Jumped(id) => AppMsg::JumpToNote(id),
+                NotesListOutput::Deleted(id) => AppMsg::NoteDeleted(id),
+                NotesListOutput::Closed => AppMsg::FocusPdf,
+            });
 
-        let model = AppModel {
+        let mut model = AppModel {
             renderer: None,
             render_gen: 0,
             path: None,
@@ -1014,6 +1152,13 @@ impl Component for AppModel {
             window: root.clone().upcast::<gtk::Window>(),
             toc,
             picker: None,
+            notes,
+            editor_slot: gtk::Box::default(),
+            editor_heading: gtk::Label::default(),
+            editor_text: gtk::TextView::default(),
+            pending_note_anchor: None,
+            editing_note_id: None,
+            notes_list,
         };
 
         let widgets = view_output!();
@@ -1030,6 +1175,74 @@ impl Component for AppModel {
             widgets.header_stack.add_named(&search_row, Some("search"));
             widgets.header_stack.set_visible_child_name("title");
         }
+
+        // Note editor: a card pinned to the top-right of the page area.
+        let editor_heading = gtk::Label::builder()
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
+        let editor_text = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .height_request(140)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        {
+            let tx = sender.input_sender().clone();
+            let view = editor_text.clone();
+            let keys = gtk::EventControllerKey::new();
+            keys.connect_key_pressed(move |_, keyval, _, state| {
+                if state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                    && matches!(keyval, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                {
+                    let buffer = view.buffer();
+                    let (start, end) = buffer.bounds();
+                    let text = buffer.text(&start, &end, true).trim().to_string();
+                    // Empty buffer behaves like a discard.
+                    if text.is_empty() {
+                        tx.send(AppMsg::NoteEdited(None)).ok();
+                    } else {
+                        tx.send(AppMsg::NoteEdited(Some(text))).ok();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                if keyval == gtk::gdk::Key::Escape && state.is_empty() {
+                    tx.send(AppMsg::NoteEdited(None)).ok();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            editor_text.add_controller(keys);
+        }
+        let editor_hint = gtk::Label::builder()
+            .xalign(0.0)
+            .label("Ctrl+Enter saves · Esc discards")
+            .css_classes(["dim-label"])
+            .build();
+        let editor_scroll = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&editor_text)
+            .build();
+        let editor_slot = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(12)
+            .margin_end(12)
+            .width_request(360)
+            .height_request(220)
+            .valign(gtk::Align::Start)
+            .halign(gtk::Align::End)
+            .css_classes(["card", "background"])
+            .build();
+        editor_slot.append(&editor_heading);
+        editor_slot.append(&editor_scroll);
+        editor_slot.append(&editor_hint);
+        editor_slot.set_visible(false);
+        widgets.content_overlay.add_overlay(&editor_slot);
+        model.editor_slot = editor_slot.clone();
+        model.editor_heading = editor_heading.clone();
+        model.editor_text = editor_text.clone();
 
         // Focus the PDF content once the window maps, so j/k/h/l scroll the
         // document instead of navigating the sidebar right after startup.
@@ -1141,6 +1354,8 @@ impl Component for AppModel {
             (AppMsg::OpenSearch, &keymap.search),
             (AppMsg::SearchNext, &keymap.search_next),
             (AppMsg::SearchPrev, &keymap.search_prev),
+            (AppMsg::AddNote, &keymap.note_add),
+            (AppMsg::BrowseNotes, &keymap.note_list),
         ]
         .into_iter()
         .filter_map(|(msg, spec)| parse_binding(spec).map(|(mods, key)| (msg, mods, key)))
@@ -1472,6 +1687,89 @@ impl Component for AppModel {
             }
             AppMsg::SearchNext => self.step_match(1),
             AppMsg::SearchPrev => self.step_match(-1),
+            AppMsg::AddNote => {
+                // Only over a real document.
+                if self.editor_slot.is_visible() || self.renderer.is_none() {
+                    return;
+                }
+                let Some((page, y_frac)) = self.note_anchor_at_center() else {
+                    return;
+                };
+                self.pending_note_anchor = Some((page, y_frac));
+                self.editing_note_id = None;
+                self.editor_heading
+                    .set_label(&format!("New note · page {}", page + 1));
+                self.editor_text.buffer().set_text("");
+                self.editor_slot.set_visible(true);
+                let view = self.editor_text.clone();
+                glib::idle_add_local_once(move || {
+                    view.grab_focus();
+                });
+            }
+            AppMsg::BrowseNotes => self.show_notes_list(),
+            AppMsg::NoteEdited(text) => {
+                if !self.editor_slot.is_visible() {
+                    return;
+                }
+                self.editor_slot.set_visible(false);
+                let Some((page, y_frac)) = self.pending_note_anchor.take() else {
+                    return;
+                };
+                // `None` means discard (Esc, or Ctrl+Enter on empty text);
+                // `Some(text)` carries the already-read buffer content.
+                self.pages_scroller.grab_focus();
+                let editing_id = self.editing_note_id.take();
+                let Some(doc) = self.path.clone() else {
+                    return;
+                };
+                if let Some(text) = text
+                    && !text.is_empty()
+                {
+                    let mut notes = self.notes.borrow_mut();
+                    match editing_id {
+                        Some(id) => {
+                            notes.update_text(id, text);
+                        }
+                        None => {
+                            notes.add(&doc, page + 1, y_frac, text);
+                        }
+                    }
+                    if let Err(error) = notes.save() {
+                        eprintln!("failed to save notes: {error:#}");
+                    }
+                }
+                self.rebuild_note_marks();
+                if let Some(area) = self.pages.get(page) {
+                    area.queue_draw();
+                }
+            }
+            AppMsg::JumpToNote(id) => {
+                let note = self.notes.borrow().get(id).map(|note| {
+                    (note.page.saturating_sub(1), note.y_frac)
+                });
+                if let Some((page, y_frac)) = note
+                    && page < self.pages.len()
+                {
+                    self.scroll_to_offset(page, y_frac);
+                    self.update_history_position();
+                }
+            }
+            AppMsg::NoteDeleted(id) => {
+                let removed_page = self.notes.borrow().get(id).and_then(|note| {
+                    (note.doc == *self.path.as_ref()?).then(|| note.page - 1)
+                });
+                if self.notes.borrow_mut().remove(id) {
+                    if let Err(error) = self.notes.borrow().save() {
+                        eprintln!("failed to save notes: {error:#}");
+                    }
+                    self.rebuild_note_marks();
+                    if let Some(page) = removed_page
+                        && let Some(area) = self.pages.get(page)
+                    {
+                        area.queue_draw();
+                    }
+                }
+            }
         }
         self.update_view(widgets, sender);
     }
