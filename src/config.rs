@@ -272,8 +272,9 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Path of the config file, honouring the XDG base directory spec.
-    pub fn path() -> PathBuf {
+    /// Base directory for yespanda state (`$XDG_CONFIG_HOME/yespanda`),
+    /// honouring the XDG base directory spec.
+    pub fn config_dir() -> PathBuf {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -281,11 +282,19 @@ impl Config {
                 PathBuf::from(home).join(".config")
             })
             .join("yespanda")
-            .join("config.toml")
+    }
+
+    /// Path of the config file, honouring the XDG base directory spec.
+    pub fn path() -> PathBuf {
+        Self::config_dir().join("config.toml")
     }
 
     /// Load the config file; a missing or malformed file yields defaults.
+    /// Also makes sure the config directory exists so first-run saves work.
     pub fn load() -> Self {
+        if let Err(error) = std::fs::create_dir_all(Self::config_dir()) {
+            eprintln!("failed to create config dir: {error:#}");
+        }
         std::fs::read_to_string(Self::path())
             .ok()
             .and_then(|raw| toml::from_str(&raw).ok())
@@ -315,7 +324,7 @@ impl From<ThemePreference> for adw::ColorScheme {
 }
 
 /// Recently opened documents with their last-viewed page, persisted to
-/// `~/.cache/yespanda/history`. Most recent entry first.
+/// `~/.config/yespanda/history`. Most recent entry first.
 #[derive(Debug, Clone, Default)]
 pub struct History {
     entries: Vec<(PathBuf, usize)>,
@@ -324,17 +333,15 @@ pub struct History {
 const HISTORY_MAX: usize = 50;
 
 impl History {
-    /// Path of the history file, honouring the XDG cache base directory spec.
+    /// Path of the history file inside the config directory.
     pub fn path() -> PathBuf {
-        let home = || std::env::var_os("HOME").unwrap_or_default();
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(home()).join(".cache"))
-            .join("yespanda")
-            .join("history")
+        Config::config_dir().join("history")
     }
 
     pub fn load() -> Self {
+        if let Err(error) = std::fs::create_dir_all(Config::config_dir()) {
+            eprintln!("failed to create config dir: {error:#}");
+        }
         let mut entries = Vec::new();
         if let Ok(raw) = std::fs::read_to_string(Self::path()) {
             for line in raw.lines() {
@@ -446,9 +453,9 @@ mod tests {
 
     #[test]
     fn history_roundtrip() {
-        let cache = std::env::temp_dir().join("yespanda-history-test");
+        let base = std::env::temp_dir().join("yespanda-history-test");
         // SAFETY: test-only, single-threaded (--test-threads=1).
-        unsafe { std::env::set_var("XDG_CACHE_HOME", &cache) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
 
         let real = Path::new("/tmp/opencode/real.pdf");
         let other = Path::new("/tmp/opencode/test.pdf");
@@ -465,6 +472,6 @@ mod tests {
         assert_eq!(loaded.page_for(other), Some(7));
         assert_eq!(loaded.entries[0].0, real);
 
-        let _ = std::fs::remove_dir_all(&cache);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

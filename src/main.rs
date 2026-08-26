@@ -11,7 +11,7 @@ use relm4::{MessageBroker, RelmApp};
 use crate::app::{AppModel, AppMsg};
 use crate::config::Config;
 
-pub const APP_ID: &str = "io.github.yespanda.Yespanda";
+pub const APP_ID: &str = "Yespanda";
 
 pub(crate) static APP_BROKER: MessageBroker<AppMsg> = MessageBroker::new();
 
