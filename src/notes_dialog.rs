@@ -111,30 +111,53 @@ impl Component for NotesList {
         widgets.list_stack.add_named(&empty_page, Some("empty"));
         widgets.list_stack.set_visible_child_name("empty");
 
-        // Ctrl+n/p move the selection; Delete removes it.
+        // Ctrl+n/p move the selection; Enter jumps; Delete removes; Esc closes.
         let keys = gtk::EventControllerKey::new();
         {
             let sender = sender.clone();
             let rows = rows.clone();
+            let root_for_keys = root.clone();
             keys.connect_key_pressed(move |_, keyval, _, state| {
+                eprintln!("[notes-key] key={keyval:?} state={state:?}");
                 if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
                     let delta: i32 = match keyval {
                         gtk::gdk::Key::n => 1,
                         gtk::gdk::Key::p => -1,
                         _ => return glib::Propagation::Proceed,
                     };
+                    eprintln!("[notes-key] move delta={delta}");
                     move_note_selection(&rows, delta);
+                    return glib::Propagation::Stop;
+                }
+                if keyval == gtk::gdk::Key::Escape && state.is_empty() {
+                    root_for_keys.close();
+                    return glib::Propagation::Stop;
+                }
+                // Enter activates the *selected* row — selection is kept in
+                // sync programmatically, so this works even before any row
+                // held real keyboard focus.
+                if matches!(keyval, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                    && state.is_empty()
+                    && let Some(row) = rows.selected_row()
+                {
+                    eprintln!("[notes-key] -> Activate");
+                    sender.input(NotesListInput::Activate(row.index().max(0) as usize));
                     return glib::Propagation::Stop;
                 }
                 if keyval == gtk::gdk::Key::Delete
                     && let Some(row) = rows.selected_row()
                 {
+                    eprintln!("[notes-key] -> Delete");
                     sender.input(NotesListInput::Delete(row.index().max(0) as usize));
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
             });
         }
+        // Capture phase: run before any focused child (rows, inner lists)
+        // can consume or reroute these keys, independent of what currently
+        // holds keyboard focus inside the sheet.
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         root.add_controller(keys);
 
 
@@ -148,18 +171,24 @@ impl Component for NotesList {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
+        eprintln!("[notes-list] msg={msg:?}");
         match msg {
             NotesListInput::Update(items) => {
                 self.items = items;
                 self.rebuild_rows(widgets);
+                if self.rows.is_mapped() {
+                    self.focus_rows_soon(widgets);
+                }
             }
             NotesListInput::Show => {
                 self.rebuild_rows(widgets);
                 root.present(Some(&self.parent));
+                self.focus_rows_soon(widgets);
             }
             NotesListInput::Activate(index) => {
                 if let Some(item) = self.items.get(index) {
                     let id = item.id;
+                    eprintln!("[notes-list] emit Jumped {id}");
                     let _ = sender.output(NotesListOutput::Jumped(id));
                     root.close();
                 }
@@ -167,6 +196,7 @@ impl Component for NotesList {
             NotesListInput::Delete(index) => {
                 if let Some(item) = self.items.get(index) {
                     let id = item.id;
+                    eprintln!("[notes-list] emit Deleted {id}");
                     let _ = sender.output(NotesListOutput::Deleted(id));
                 }
             }
@@ -194,6 +224,23 @@ impl NotesList {
         if let Some(first) = rows.row_at_index(0) {
             rows.select_row(Some(&first));
         }
+    }
+
+    /// Give keyboard focus to the selected (or first) row, but only once
+    /// the dialog is actually on screen. Grabbing earlier would fail and
+    /// swallow GTK's automatic initial focus, leaving every key dead.
+    fn focus_rows_soon(&self, widgets: &NotesListWidgets) {
+        let rows = self.rows.clone();
+        glib::idle_add_local_once(move || {
+            if !rows.is_mapped() {
+                return;
+            }
+            let target = rows.selected_row().or_else(|| rows.row_at_index(0));
+            if let Some(row) = target {
+                let _ = row.grab_focus();
+            }
+        });
+        let _ = widgets;
     }
 }
 

@@ -749,10 +749,9 @@ impl AppModel {
         adjustment.set_value(target.clamp(adjustment.lower(), max));
     }
 
-    /// Refresh and present the notes browser for the open document.
-    fn show_notes_list(&mut self) {
-        let items: Vec<NotesListItem> = self
-            .path
+    /// Rows describing the open document's notes.
+    fn build_note_items(&self) -> Vec<NotesListItem> {
+        self.path
             .as_ref()
             .map(|path| {
                 self.notes
@@ -771,7 +770,12 @@ impl AppModel {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// Refresh and present the notes browser for the open document.
+    fn show_notes_list(&mut self) {
+        let items = self.build_note_items();
         self.notes_list.emit(NotesListInput::Update(items));
         self.notes_list.emit(NotesListInput::Show);
     }
@@ -1744,6 +1748,7 @@ impl Component for AppModel {
                 }
             }
             AppMsg::JumpToNote(id) => {
+                eprintln!("[app] JumpToNote {id}");
                 let note = self.notes.borrow().get(id).map(|note| {
                     (note.page.saturating_sub(1), note.y_frac)
                 });
@@ -1755,6 +1760,7 @@ impl Component for AppModel {
                 }
             }
             AppMsg::NoteDeleted(id) => {
+                eprintln!("[app] NoteDeleted {id}");
                 let removed_page = self.notes.borrow().get(id).and_then(|note| {
                     (note.doc == *self.path.as_ref()?).then(|| note.page - 1)
                 });
@@ -1763,6 +1769,10 @@ impl Component for AppModel {
                         eprintln!("failed to save notes: {error:#}");
                     }
                     self.rebuild_note_marks();
+                    // Keep the open dialog in sync instead of leaving a
+                    // stale row behind.
+                    let items = self.build_note_items();
+                    self.notes_list.emit(NotesListInput::Update(items));
                     if let Some(page) = removed_page
                         && let Some(area) = self.pages.get(page)
                     {
