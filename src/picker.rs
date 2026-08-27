@@ -9,7 +9,7 @@ use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 use relm4::gtk::prelude::AdjustmentExt;
 use adw::prelude::*;
-use relm4::{adw, Component, ComponentParts, ComponentSender, RelmRemoveAllExt};
+use relm4::{adw, Component, ComponentParts, ComponentSender};
 
 const FILTER_DEBOUNCE_MS: u32 = 150;
 const MAX_EMPTY_RESULTS: usize = 50;
@@ -430,7 +430,10 @@ fn scroll_row_into_view(
     list: &gtk::ListBox,
     row: &gtk::ListBoxRow,
 ) {
-    let (_, y) = row.translate_coordinates(list, 0.0, 0.0).unwrap_or((0.0, 0.0));
+    let y = row
+        .compute_point(list, &gtk::graphene::Point::new(0.0, 0.0))
+        .map(|p| p.y() as f64)
+        .unwrap_or(0.0);
     let top = y.max(0.0);
     let bottom = top + row.height() as f64;
     let adjustment = scroller.vadjustment();

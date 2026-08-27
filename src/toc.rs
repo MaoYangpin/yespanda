@@ -250,7 +250,10 @@ impl TocSidebar {
         row.grab_focus();
         if let Some(scroller) = list.parent().and_then(|p| p.downcast::<gtk::ScrolledWindow>().ok())
         {
-            let (_, y) = row.translate_coordinates(list, 0.0, 0.0).unwrap_or((0.0, 0.0));
+            let y = row
+                .compute_point(list, &gtk::graphene::Point::new(0.0, 0.0))
+                .map(|p| p.y() as f64)
+                .unwrap_or(0.0);
             let top = y.max(0.0);
             let bottom = top + row.height() as f64;
             let adjustment = scroller.vadjustment();

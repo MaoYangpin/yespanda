@@ -11,7 +11,7 @@ use relm4::gtk::gdk;
 use relm4::gtk::prelude::AdjustmentExt;
 use relm4::{
     Component, ComponentController, ComponentParts, ComponentSender, Controller,
-    RelmRemoveAllExt, adw, gtk,
+    adw, gtk,
 };
 
 use crate::config::{Config, History, parse_binding};
@@ -626,10 +626,10 @@ impl AppModel {
 
     /// Redraw the page's widget if it is currently mapped to a pool slot.
     fn queue_page_draw(&self, index: usize) {
-        if let Some(&slot) = self.page_slot.get(&index) {
-            if let Some(widget) = self.pages_pool.get(slot) {
-                widget.queue_draw();
-            }
+        if let Some(&slot) = self.page_slot.get(&index)
+            && let Some(widget) = self.pages_pool.get(slot)
+        {
+            widget.queue_draw();
         }
     }
 
@@ -672,12 +672,12 @@ impl AppModel {
 
         // Free slots whose page left the window.
         for slot in 0..self.slot_page.len() {
-            if let Some(p) = self.slot_page[slot] {
-                if p < first || p >= last {
-                    self.slot_page[slot] = None;
-                    self.page_slot.remove(&p);
-                    self.pages_pool[slot].set_visible(false);
-                }
+            if let Some(p) = self.slot_page[slot]
+                && (p < first || p >= last)
+            {
+                self.slot_page[slot] = None;
+                self.page_slot.remove(&p);
+                self.pages_pool[slot].set_visible(false);
             }
         }
 

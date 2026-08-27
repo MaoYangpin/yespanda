@@ -1,6 +1,5 @@
 use adw::prelude::*;
 use gtk::glib;
-use relm4::RelmRemoveAllExt;
 use relm4::{adw, gtk, Component, ComponentParts, ComponentSender};
 
 // ---- list ---------------------------------------------------------------
