@@ -8,7 +8,7 @@ use adw::prelude::*;
 use relm4::gtk::glib;
 use relm4::gtk::glib::clone;
 use relm4::gtk::gdk;
-use relm4::gtk::prelude::{AdjustmentExt, GdkCairoContextExt};
+use relm4::gtk::prelude::AdjustmentExt;
 use relm4::{
     Component, ComponentController, ComponentParts, ComponentSender, Controller,
     RelmRemoveAllExt, adw, gtk,
@@ -129,6 +129,10 @@ struct PoolState {
 /// parallel with no locking while a render is running.
 struct Renderer {
     pool: std::sync::Arc<Pool>,
+    /// Worker threads for the current document. Stored so we can join them
+    /// on drop — otherwise each thread keeps its `PdfDoc` (mmap'd PDF) alive
+    /// until it happens to exit, leaking memory across file switches.
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Renderer {
@@ -141,6 +145,7 @@ impl Renderer {
             .unwrap_or(2)
             .clamp(1, 4);
         let pool = std::sync::Arc::new(Pool::default());
+        let mut handles = Vec::with_capacity(threads);
         for worker in 0..threads {
             let pool = pool.clone();
             let path = path.clone();
@@ -148,9 +153,9 @@ impl Renderer {
             // The main-thread document can only feed ONE worker without
             // sharing; see the Send note on `PdfDoc`.
             let doc = if worker == 0 { leader.take() } else { None };
-            std::thread::spawn(move || run_worker(pool, path, doc, reply));
+            handles.push(std::thread::spawn(move || run_worker(pool, path, doc, reply)));
         }
-        Self { pool }
+        Self { pool, handles }
     }
 
     fn request(&self, job: RenderJob) {
@@ -163,10 +168,17 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        let mut state = self.pool.inner.lock().unwrap();
-        state.shutdown = true;
-        state.job = None;
-        self.pool.work_available.notify_all();
+        {
+            let mut state = self.pool.inner.lock().unwrap();
+            state.shutdown = true;
+            state.job = None;
+            self.pool.work_available.notify_all();
+        }
+        // Wait for every worker to release its PdfDoc before the new file's
+        // pool starts, so mmap'd documents from previous files don't pile up.
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -224,77 +236,127 @@ fn run_worker(
     }
 }
 
-/// Rendered page image plus a cairo-friendly copy for the draw handler.
+/// Rendered page image. Stored as a `gdk::Texture` (not a `Pixbuf`) so the
+/// page widget can paint it through `gtk::Snapshot::append_texture`. GSK keys
+/// the GL upload on the texture's identity, which is stable across frames, so
+/// the GPU texture cache stays bounded to the live pages. Painting a `Pixbuf`
+/// from a cairo draw func forces a fresh per-frame GL upload with no identity
+/// to dedupe on, which leaked GPU memory without bound while scrolling.
 struct PageArt {
-    pixbuf: gdk::gdk_pixbuf::Pixbuf,
+    texture: gdk::Texture,
 }
 
-/// Paint one page widget: the rendered page (horizontally centered when the
-/// allocation is wider) plus any search highlights on top.
-fn draw_page(
-    _area: &gtk::DrawingArea,
-    cr: &relm4::gtk::cairo::Context,
-    width: i32,
-    height: i32,
-    index: usize,
-    view: &ViewState,
-) {
-    let zoom = view.zoom.get();
-    let textures = view.textures.borrow();
-    if let Some(art) = textures.get(&index) {
-        // The texture was rendered at exactly `zoom` scale, so its size in
-        // logical pixels matches the requested page box; center it when the
-        // allocation is wider (hexpand fills the scroller).
-        let tex_w = art.pixbuf.width() as f64;
-        let tex_h = art.pixbuf.height() as f64;
-        let ox = ((width as f64 - tex_w) / 2.0).max(0.0);
-        let oy = ((height as f64 - tex_h) / 2.0).max(0.0);
-        cr.set_source_pixbuf(&art.pixbuf, ox, oy);
-        let _ = cr.paint();
+/// One page widget. Paints its `gdk::Texture` plus vector overlays (note
+/// tabs, search highlights) via `gtk::Snapshot`, which keeps the GPU texture
+/// cache bounded instead of growing per redraw.
+mod page_view {
+    use super::*;
+    use gtk::subclass::prelude::*;
 
-        // Note markers: slim blue tabs on the page's right edge, one per
-        // note anchored on this page.
-        {
-            let marks = view.note_marks.borrow().get(&index).cloned();
-            if let Some(fracs) = marks
-                && let Some(art) = textures.get(&index)
-            {
-                let tex_w = art.pixbuf.width() as f64;
-                let tex_h = art.pixbuf.height() as f64;
-                let ox = ((width as f64 - tex_w) / 2.0).max(0.0);
-                let oy = ((height as f64 - tex_h) / 2.0).max(0.0);
-                let right = ox + tex_w;
-                cr.set_source_rgba(0.20, 0.55, 0.95, 0.90);
+    #[derive(Default)]
+    pub struct PageViewPriv {
+        view: std::cell::RefCell<Option<Rc<ViewState>>>,
+        index: std::cell::Cell<usize>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PageViewPriv {
+        const NAME: &'static str = "YespandaPageView";
+        type Type = PageView;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for PageViewPriv {}
+    impl WidgetImpl for PageViewPriv {
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            let widget = self.obj();
+            let view = self.view.borrow();
+            let Some(view) = view.as_ref() else { return };
+            let index = self.index.get();
+            let zoom = view.zoom.get();
+            let textures = view.textures.borrow();
+            let Some(art) = textures.get(&index) else { return };
+            let tex = &art.texture;
+            let tex_w = tex.width() as f64;
+            let tex_h = tex.height() as f64;
+            let w = widget.width() as f64;
+            let h = widget.height() as f64;
+            // Rendered at exactly `zoom`, so it matches the page box; center
+            // horizontally when the allocation is wider (hexpand fills it).
+            let ox = ((w - tex_w) / 2.0).max(0.0);
+            let oy = ((h - tex_h) / 2.0).max(0.0);
+            snapshot.append_texture(
+                tex,
+                &gtk::graphene::Rect::new(ox as f32, oy as f32, tex_w as f32, tex_h as f32),
+            );
+
+            // Note markers: slim blue triangle tabs on the page's right edge.
+            if let Some(fracs) = view.note_marks.borrow().get(&index).cloned() {
+                let right = (ox + tex_w) as f32;
                 for frac in fracs {
-                    let y = oy + frac * tex_h;
-                    cr.move_to(right - 9.0, y - 7.0);
-                    cr.line_to(right, y);
-                    cr.line_to(right - 9.0, y + 7.0);
-                    cr.close_path();
-                    let _ = cr.fill();
+                    let y = (oy + frac * tex_h) as f32;
+                    let b = gsk4::PathBuilder::new();
+                    b.move_to(right - 9.0, y - 7.0);
+                    b.line_to(right, y);
+                    b.line_to(right - 9.0, y + 7.0);
+                    b.close();
+                    snapshot.append_fill(
+                        &b.to_path(),
+                        gsk4::FillRule::Winding,
+                        &gdk::RGBA::new(0.20, 0.55, 0.95, 0.90),
+                    );
+                }
+            }
+
+            // Search highlights. The active match gets a stronger fill and an
+            // orange outline; others are a soft yellow wash.
+            let active = view.current_match.get();
+            let rects = view.matches.borrow().get(&index).cloned().unwrap_or_default();
+            for (i, rect) in rects.iter().enumerate() {
+                let bounds = gtk::graphene::Rect::new(
+                    (rect.x * zoom + ox) as f32,
+                    (rect.y * zoom + oy) as f32,
+                    (rect.w * zoom) as f32,
+                    (rect.h * zoom) as f32,
+                );
+                let is_active = active == Some((index, i));
+                let color = if is_active {
+                    gdk::RGBA::new(1.0, 0.78, 0.1, 0.50)
+                } else {
+                    gdk::RGBA::new(1.0, 0.78, 0.1, 0.28)
+                };
+                snapshot.append_color(&color, &bounds);
+                if is_active {
+                    let b = gsk4::PathBuilder::new();
+                    b.add_rect(&bounds);
+                    snapshot.append_stroke(
+                        &b.to_path(),
+                        &gsk4::Stroke::new(2.0),
+                        &gdk::RGBA::new(0.98, 0.45, 0.05, 0.95),
+                    );
                 }
             }
         }
+    }
 
-        // Search highlights on top. The active match gets a stronger fill
-        // and an orange outline; all other hits are a soft yellow wash.
-        let active = view.current_match.get();
-        let rects = view.matches.borrow().get(&index).cloned().unwrap_or_default();
-        for (i, rect) in rects.iter().enumerate() {
-            let x = rect.x * zoom + ox;
-            let y = rect.y * zoom + oy;
-            let w = rect.w * zoom;
-            let h = rect.h * zoom;
-            let is_active = active == Some((index, i));
-            cr.set_source_rgba(1.0, 0.78, 0.1, if is_active { 0.50 } else { 0.28 });
-            cr.rectangle(x, y, w, h);
-            let _ = cr.fill();
-            if is_active {
-                cr.set_source_rgba(0.98, 0.45, 0.05, 0.95);
-                cr.set_line_width(2.0);
-                cr.rectangle(x + 1.0, y + 1.0, w - 2.0, h - 2.0);
-                let _ = cr.stroke();
-            }
+    glib::wrapper! {
+        pub struct PageView(ObjectSubclass<PageViewPriv>)
+            @extends gtk::Widget,
+            @implements gtk::Buildable, gtk::Accessible, gtk::ConstraintTarget;
+    }
+
+    impl PageView {
+        pub(crate) fn new(view: Rc<ViewState>, index: usize) -> Self {
+            let obj = glib::Object::builder::<Self>().build();
+            obj.imp().view.borrow_mut().replace(view);
+            obj.imp().index.set(index);
+            obj
+        }
+
+        /// Point this (pooled) widget at a different page. The caller is
+        /// responsible for `queue_draw` afterwards.
+        pub(crate) fn set_page(&self, index: usize) {
+            self.imp().index.set(index);
         }
     }
 }
@@ -315,7 +377,7 @@ fn scan_document(path: &Path, n_pages: usize, query: &str) -> HashMap<usize, Vec
 }
 
 #[derive(Default)]
-struct ViewState {
+pub(crate) struct ViewState {
     textures: RefCell<HashMap<usize, PageArt>>,
     /// Search hits per page in top-left-origin points (see
     /// [`MatchRect`]); empty when no search results are shown.
@@ -342,8 +404,18 @@ pub struct AppModel {
     /// Textures, search matches, and zoom shared with the page draw
     /// handlers (all mutated on the main thread only).
     view: Rc<ViewState>,
-    pages: Vec<gtk::DrawingArea>,
-    pages_box: gtk::Box,
+    /// A small, fixed pool of reusable page widgets. Only the pages in the
+    /// visible window (plus a prefetch margin) are ever assigned to a pool
+    /// widget, so the number of widgets — and thus the GSK-retained page
+    /// textures — stays bounded no matter how long the document is.
+    pages_pool: Vec<page_view::PageView>,
+    /// Pool slot -> page index currently shown there (`None` = free slot).
+    slot_page: Vec<Option<usize>>,
+    /// Page index -> pool slot showing it (inverse of `slot_page`).
+    page_slot: HashMap<usize, usize>,
+    /// The single scrolled container holding the pool widgets, sized to the
+    /// full document so the scrollbar tracks the whole file.
+    pages_fixed: gtk::Fixed,
     pages_scroller: gtk::ScrolledWindow,
     status_page: adw::StatusPage,
     /// Lives inside the header bar's swap stack; hidden while searching.
@@ -542,41 +614,154 @@ impl AppModel {
     fn invalidate_textures(&mut self) {
         self.render_gen += 1;
         self.view.textures.borrow_mut().clear();
-        for page in &self.pages {
+        for page in &self.pages_pool {
             page.queue_draw();
         }
     }
 
-    fn rebuild_pages(&mut self) {
-        self.pages_box.remove_all();
-        self.pages.clear();
-        // New widgets: any in-flight reply targets dead indexes.
-        self.invalidate_textures();
+    /// Content width the pages are laid out within (== scroller viewport).
+    fn content_width(&self) -> i32 {
+        self.pages_scroller.width().max(self.last_viewport_width)
+    }
 
-        for (index, (_width_pt, height_pt)) in self.page_sizes_pt.iter().enumerate() {
-            let area = gtk::DrawingArea::builder().hexpand(true).build();
-            area.set_size_request(0, (height_pt * self.zoom).round() as i32);
-            let view = self.view.clone();
-            area.set_draw_func(move |area, cr, width, height| {
-                draw_page(area, cr, width, height, index, &view);
-            });
-            self.pages_box.append(&area);
-            self.pages.push(area);
+    /// Redraw the page's widget if it is currently mapped to a pool slot.
+    fn queue_page_draw(&self, index: usize) {
+        if let Some(&slot) = self.page_slot.get(&index) {
+            if let Some(widget) = self.pages_pool.get(slot) {
+                widget.queue_draw();
+            }
         }
+    }
+
+    /// The page range to keep on screen, derived from the scroll position
+    /// and inflated by a prefetch margin on each side.
+    fn visible_window(&self) -> (usize, usize) {
+        let adjustment = self.pages_scroller.vadjustment();
+        let top = adjustment.value();
+        let bottom = top + adjustment.page_size();
+        let offsets = self.offsets();
+        let first = offsets.partition_point(|start| *start < top - PAGE_SPACING as f64);
+        let last = offsets
+            .partition_point(|start| *start < bottom)
+            .min(self.page_sizes_pt.len());
+        const PREFETCH: usize = 2;
+        (
+            first.saturating_sub(PREFETCH),
+            (last + PREFETCH).min(self.page_sizes_pt.len()),
+        )
+    }
+
+    /// Assign the pooled widgets to `first..last`, growing the pool if the
+    /// window is larger than the current pool, freeing slots that scrolled
+    /// out, and repositioning every assigned widget for the current zoom.
+    fn layout_pages(&mut self, first: usize, last: usize) {
+        if self.page_sizes_pt.is_empty() {
+            return;
+        }
+        let offsets = self.offsets();
+        let content_width = self.content_width();
+        let window_len = last.saturating_sub(first);
+
+        // Grow the pool so it can cover the whole window at once.
+        while self.slot_page.len() < window_len {
+            let widget = page_view::PageView::new(self.view.clone(), 0);
+            self.pages_fixed.put(&widget, 0.0, 0.0);
+            self.pages_pool.push(widget);
+            self.slot_page.push(None);
+        }
+
+        // Free slots whose page left the window.
+        for slot in 0..self.slot_page.len() {
+            if let Some(p) = self.slot_page[slot] {
+                if p < first || p >= last {
+                    self.slot_page[slot] = None;
+                    self.page_slot.remove(&p);
+                    self.pages_pool[slot].set_visible(false);
+                }
+            }
+        }
+
+        // Assign each wanted page to a free slot.
+        for p in first..last {
+            if self.page_slot.contains_key(&p) {
+                continue;
+            }
+            let slot = self
+                .slot_page
+                .iter()
+                .position(|s| s.is_none())
+                .unwrap_or_else(|| {
+                    let widget = page_view::PageView::new(self.view.clone(), 0);
+                    self.pages_fixed.put(&widget, 0.0, 0.0);
+                    self.pages_pool.push(widget);
+                    self.slot_page.push(None);
+                    self.slot_page.len() - 1
+                });
+            self.slot_page[slot] = Some(p);
+            self.page_slot.insert(p, slot);
+            self.place_widget(slot, p, &offsets, content_width);
+        }
+    }
+
+    /// Size, position and paint a single pool widget for `page`.
+    fn place_widget(&self, slot: usize, page: usize, offsets: &[f64], content_width: i32) {
+        let widget = &self.pages_pool[slot];
+        let (_, height_pt) = self.page_sizes_pt[page];
+        widget.set_page(page);
+        widget.set_size_request(content_width, (height_pt * self.zoom).round() as i32);
+        let y = offsets[page];
+        self.pages_fixed.move_(widget, 0.0, y);
+        widget.set_visible(true);
+        widget.queue_draw();
+    }
+
+    /// Resize the scrolled content to span the full document.
+    fn update_fixed_size(&self) {
+        if self.page_sizes_pt.is_empty() {
+            return;
+        }
+        let offsets = self.offsets();
+        let height = offsets
+            .last()
+            .copied()
+            .unwrap_or(0.0)
+            + self.page_sizes_pt.last().map(|(_, h)| *h).unwrap_or(0.0) * self.zoom
+            + PAGE_SPACING as f64;
+        self.pages_fixed
+            .set_size_request(self.content_width(), height.round() as i32);
+    }
+
+    fn rebuild_pages(&mut self) {
+        // Tear down the previous pool and its slot bookkeeping; the pool is
+        // rebuilt lazily by `layout_pages` on the next `render_visible`.
+        for widget in &self.pages_pool {
+            self.pages_fixed.remove(widget);
+        }
+        self.pages_pool.clear();
+        self.slot_page.clear();
+        self.page_slot.clear();
+        // New document: any in-flight reply targets dead indexes.
+        self.invalidate_textures();
     }
 
     fn resize_pages(&mut self) {
         self.view.zoom.set(self.zoom);
-        for (index, page) in self.pages.iter().enumerate() {
-            let (_, height_pt) = self.page_sizes_pt[index];
-            page.set_size_request(0, (height_pt * self.zoom).round() as i32);
-            page.queue_draw();
+        // Re-place every currently assigned pool widget at the new scale.
+        // Changing the sizes nudges the scrolled content extent, which fires
+        // `ViewportChanged` and drives the follow-up texture re-render.
+        let offsets = self.offsets();
+        let content_width = self.content_width();
+        for (slot, page) in self.slot_page.iter().enumerate() {
+            if let Some(p) = *page {
+                self.place_widget(slot, p, &offsets, content_width);
+            }
         }
+        self.update_fixed_size();
     }
 
     /// Top-edge pixel offset of every page at the current zoom.
     fn offsets(&self) -> Vec<f64> {
-        let mut offsets = Vec::with_capacity(self.pages.len());
+        let mut offsets = Vec::with_capacity(self.page_sizes_pt.len());
         let mut cursor = 0.0;
         for (_, height_pt) in &self.page_sizes_pt {
             offsets.push(cursor);
@@ -609,25 +794,16 @@ impl AppModel {
         self.invalidate_textures();
     }
 
-    /// Ask the renderer pool for every visible page that is not already
-    /// painted, plus a small prefetch margin above and below. Results come
+    /// Map the pooled widgets over the visible window, then ask the renderer
+    /// pool for any page in that window that is not yet painted. Results come
     /// back as [`AppMsg::PageRendered`].
     fn render_visible(&mut self) {
-        let adjustment = self.pages_scroller.vadjustment();
-        let top = adjustment.value();
-        let bottom = top + adjustment.page_size();
-        let offsets = self.offsets();
-
-        let first = offsets.partition_point(|start| *start < top - PAGE_SPACING as f64);
-        let last = offsets
-            .partition_point(|start| *start < bottom)
-            .min(self.pages.len());
-
-        // Prefetch two pages past each edge so slow scrolling mostly hits
-        // the texture cache instead of waiting on a render round trip.
-        const PREFETCH: usize = 2;
-        let first = first.saturating_sub(PREFETCH);
-        let last = (last + PREFETCH).min(self.pages.len());
+        if self.page_sizes_pt.is_empty() {
+            return;
+        }
+        let (first, last) = self.visible_window();
+        self.layout_pages(first, last);
+        self.update_fixed_size();
 
         let textures = self.view.textures.borrow();
         let missing: Vec<usize> = (first..last)
@@ -649,12 +825,12 @@ impl AppModel {
             });
         }
 
-        // Keep a small margin of pages around the viewport painted so slow
-        // scrolling does not flash empty gaps.
+        // Drop textures for pages that scrolled out of the windowed range so
+        // the cache — and the widgets' retained snapshots — stay bounded.
         self.view
             .textures
             .borrow_mut()
-            .retain(|index, _| index + 4 >= first && *index <= last + 4);
+            .retain(|index, _| *index >= first && *index < last);
     }
 
     /// Record the current page for the open document in the in-memory
@@ -806,9 +982,7 @@ impl AppModel {
         self.current_flat = 0;
         self.match_label.set_label("");
         for index in redrawn {
-            if let Some(page) = self.pages.get(index) {
-                page.queue_draw();
-            }
+            self.queue_page_draw(index);
         }
     }
 
@@ -830,9 +1004,7 @@ impl AppModel {
         self.match_label.set_label(&label);
 
         for index in previous.iter().copied().chain(self.view.matches.borrow().keys().copied()) {
-            if let Some(page) = self.pages.get(index) {
-                page.queue_draw();
-            }
+            self.queue_page_draw(index);
         }
         if let Some((page, index_in_page)) = first {
             let rect = {
@@ -870,9 +1042,7 @@ impl AppModel {
         }
         redraw.push(page);
         for p in redraw {
-            if let Some(area) = self.pages.get(p) {
-                area.queue_draw();
-            }
+            self.queue_page_draw(p);
         }
         let rect = {
             let matches = self.view.matches.borrow();
@@ -890,7 +1060,7 @@ impl AppModel {
     fn nth_match(&self, n: usize) -> Option<(usize, usize)> {
         let matches = self.view.matches.borrow();
         let mut walked = 0usize;
-        for page in 0..self.pages.len() {
+        for page in 0..self.page_sizes_pt.len() {
             let count = matches.get(&page).map_or(0, |rects| rects.len());
             if n < walked + count {
                 return Some((page, n - walked));
@@ -908,14 +1078,14 @@ impl AppModel {
 
     /// Index of the page under the viewport's vertical centre.
     fn current_page(&self) -> Option<usize> {
-        if self.pages.is_empty() {
+        if self.page_sizes_pt.is_empty() {
             return None;
         }
         let adjustment = self.pages_scroller.vadjustment();
         let centre = adjustment.value() + adjustment.page_size() / 2.0;
         let offsets = self.offsets();
         let page = offsets.partition_point(|start| *start <= centre).max(1) - 1;
-        Some(page.min(self.pages.len() - 1))
+        Some(page.min(self.page_sizes_pt.len() - 1))
     }
 
     /// Push the hover-highlight to the sidebar entry covering the visible
@@ -956,7 +1126,7 @@ impl AppModel {
     }
 
     fn scroll_to_page(&mut self, page: usize) {
-        if page >= self.pages.len() {
+        if page >= self.page_sizes_pt.len() {
             return;
         }
         let offsets = self.offsets();
@@ -1067,14 +1237,11 @@ impl Component for AppModel {
             });
         let toc_widget = toc.widget().clone();
 
-        let pages_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(PAGE_SPACING)
-            .build();
+        let pages_fixed = gtk::Fixed::builder().build();
         let pages_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
-            .child(&pages_box)
+            .child(&pages_fixed)
             .build();
 
         let status_page = adw::StatusPage::builder()
@@ -1133,8 +1300,10 @@ impl Component for AppModel {
             last_viewport_width: 0,
             page_sizes_pt: Vec::new(),
             view: view.clone(),
-            pages: Vec::new(),
-            pages_box: pages_box.clone(),
+            pages_pool: Vec::new(),
+            slot_page: Vec::new(),
+            page_slot: HashMap::new(),
+            pages_fixed: pages_fixed.clone(),
             pages_scroller: pages_scroller.clone(),
             status_page: status_page.clone(),
             title_widget: title_widget.clone(),
@@ -1496,7 +1665,7 @@ impl Component for AppModel {
                 // 1-based as typed; `scroll_to_page` ignores out-of-range
                 // pages, so clamping is all that is needed here.
                 let index = (page as usize).saturating_sub(1);
-                if index < self.pages.len() {
+                if index < self.page_sizes_pt.len() {
                     self.scroll_to_page(index);
                 }
             }
@@ -1535,7 +1704,7 @@ impl Component for AppModel {
                 // replies for pages that were rebuilt meanwhile.
                 if generation != self.render_gen
                     || zoom != self.zoom
-                    || index >= self.pages.len()
+                    || index >= self.page_sizes_pt.len()
                     || self.view.textures.borrow().contains_key(&index)
                 {
                     return;
@@ -1549,12 +1718,11 @@ impl Component for AppModel {
                             &glib::Bytes::from_owned(bytes),
                             width as usize * 4,
                         );
-                        let pixbuf = gdk::pixbuf_get_from_texture(&texture)
-                            .expect("texture to pixbuf conversion");
-                        self.view.textures.borrow_mut().insert(index, PageArt { pixbuf });
-                        if let Some(page) = self.pages.get(index) {
-                            page.queue_draw();
-                        }
+                        self.view
+                            .textures
+                            .borrow_mut()
+                            .insert(index, PageArt { texture: texture.into() });
+                        self.queue_page_draw(index);
                     }
                     Err(error) => eprintln!("failed to render page {}: {error}", index + 1),
                 }
@@ -1671,7 +1839,7 @@ impl Component for AppModel {
                 let Some(path) = self.path.clone() else {
                     return;
                 };
-                let n_pages = self.pages.len();
+                let n_pages = self.page_sizes_pt.len();
                 if n_pages == 0 {
                     return;
                 }
@@ -1743,24 +1911,20 @@ impl Component for AppModel {
                     }
                 }
                 self.rebuild_note_marks();
-                if let Some(area) = self.pages.get(page) {
-                    area.queue_draw();
-                }
+                self.queue_page_draw(page);
             }
             AppMsg::JumpToNote(id) => {
-                eprintln!("[app] JumpToNote {id}");
                 let note = self.notes.borrow().get(id).map(|note| {
                     (note.page.saturating_sub(1), note.y_frac)
                 });
                 if let Some((page, y_frac)) = note
-                    && page < self.pages.len()
+                    && page < self.page_sizes_pt.len()
                 {
                     self.scroll_to_offset(page, y_frac);
                     self.update_history_position();
                 }
             }
             AppMsg::NoteDeleted(id) => {
-                eprintln!("[app] NoteDeleted {id}");
                 let removed_page = self.notes.borrow().get(id).and_then(|note| {
                     (note.doc == *self.path.as_ref()?).then(|| note.page - 1)
                 });
@@ -1773,10 +1937,8 @@ impl Component for AppModel {
                     // stale row behind.
                     let items = self.build_note_items();
                     self.notes_list.emit(NotesListInput::Update(items));
-                    if let Some(page) = removed_page
-                        && let Some(area) = self.pages.get(page)
-                    {
-                        area.queue_draw();
+                    if let Some(page) = removed_page {
+                        self.queue_page_draw(page);
                     }
                 }
             }

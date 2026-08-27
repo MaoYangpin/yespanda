@@ -10,6 +10,8 @@ path = "src/main.rs"
 [dependencies]
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5", "v1_6"] }
 relm4 = { version = "0.11", features = ["libadwaita"] }
+gtk4 = { version = "0.11", features = ["v4_14"] }
+gsk4 = { version = "0.11", features = ["v4_14"] }
 poppler-rs = { version = "0.26", features = ["v22_2"] }
 cairo-rs = { version = "0.22", features = ["pdf"] }
 anyhow = "1"
