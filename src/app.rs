@@ -413,9 +413,15 @@ pub struct AppModel {
     slot_page: Vec<Option<usize>>,
     /// Page index -> pool slot showing it (inverse of `slot_page`).
     page_slot: HashMap<usize, usize>,
-    /// The single scrolled container holding the pool widgets, sized to the
-    /// full document so the scrollbar tracks the whole file.
-    pages_fixed: gtk::Fixed,
+    /// The single scrolled container holding the pool widgets. A vertical
+    /// `gtk::Box` (not a `gtk::Fixed`): its page children carry no explicit
+    /// width and just expand (`hexpand`), so the content never reports a wide
+    /// minimum that would force the window to grow when the sidebar shows.
+    /// Top/bottom spacers stand in for off-window pages so the scroll extent
+    /// spans the whole document while only the visible slice is alive.
+    pages_box: gtk::Box,
+    top_spacer: gtk::DrawingArea,
+    bottom_spacer: gtk::DrawingArea,
     pages_scroller: gtk::ScrolledWindow,
     status_page: adw::StatusPage,
     /// Lives inside the header bar's swap stack; hidden while searching.
@@ -619,11 +625,6 @@ impl AppModel {
         }
     }
 
-    /// Content width the pages are laid out within (== scroller viewport).
-    fn content_width(&self) -> i32 {
-        self.pages_scroller.width().max(self.last_viewport_width)
-    }
-
     /// Redraw the page's widget if it is currently mapped to a pool slot.
     fn queue_page_draw(&self, index: usize) {
         if let Some(&slot) = self.page_slot.get(&index)
@@ -659,18 +660,18 @@ impl AppModel {
             return;
         }
         let offsets = self.offsets();
-        let content_width = self.content_width();
         let window_len = last.saturating_sub(first);
 
         // Grow the pool so it can cover the whole window at once.
         while self.slot_page.len() < window_len {
-            let widget = page_view::PageView::new(self.view.clone(), 0);
-            self.pages_fixed.put(&widget, 0.0, 0.0);
+            let widget = self.make_page_widget();
+            self.pages_box.append(&widget);
             self.pages_pool.push(widget);
             self.slot_page.push(None);
         }
 
-        // Free slots whose page left the window.
+        // Free slots whose page left the window (hidden children take no
+        // space and no spacing in the Box, so they don't disturb the layout).
         for slot in 0..self.slot_page.len() {
             if let Some(p) = self.slot_page[slot]
                 && (p < first || p >= last)
@@ -691,55 +692,89 @@ impl AppModel {
                 .iter()
                 .position(|s| s.is_none())
                 .unwrap_or_else(|| {
-                    let widget = page_view::PageView::new(self.view.clone(), 0);
-                    self.pages_fixed.put(&widget, 0.0, 0.0);
+                    let widget = self.make_page_widget();
+                    self.pages_box.append(&widget);
                     self.pages_pool.push(widget);
                     self.slot_page.push(None);
                     self.slot_page.len() - 1
                 });
             self.slot_page[slot] = Some(p);
             self.page_slot.insert(p, slot);
-            self.place_widget(slot, p, &offsets, content_width);
+            self.place_widget(slot, p);
         }
+
+        // The pages carry no explicit width, so their position in the
+        // document is expressed purely by the Box order + spacer heights.
+        self.update_spacers(first, last, &offsets);
+        let mut anchor: Option<gtk::Widget> = Some(self.top_spacer.clone().upcast());
+        for p in first..last {
+            if let Some(&slot) = self.page_slot.get(&p) {
+                let w: gtk::Widget = self.pages_pool[slot].clone().upcast();
+                self.pages_box.reorder_child_after(&w, anchor.as_ref());
+                anchor = Some(w);
+            }
+        }
+        let bottom: gtk::Widget = self.bottom_spacer.clone().upcast();
+        self.pages_box.reorder_child_after(&bottom, anchor.as_ref());
     }
 
-    /// Size, position and paint a single pool widget for `page`.
-    fn place_widget(&self, slot: usize, page: usize, offsets: &[f64], content_width: i32) {
+    /// A pooled page widget: no explicit width (`hexpand` fills whatever the
+    /// scroller provides), so it can never widen the content's minimum size
+    /// and grow the window when the sidebar toggles.
+    fn make_page_widget(&self) -> page_view::PageView {
+        let widget = page_view::PageView::new(self.view.clone(), 0);
+        widget.set_hexpand(true);
+        widget.set_size_request(0, 0);
+        widget.set_visible(false);
+        widget
+    }
+
+    /// Size and paint a single pool widget for `page`. Only the height is set
+    /// explicitly; the width stays 0 + `hexpand` and the vertical position
+    /// comes from the Box order and the spacer heights.
+    fn place_widget(&self, slot: usize, page: usize) {
         let widget = &self.pages_pool[slot];
         let (_, height_pt) = self.page_sizes_pt[page];
         widget.set_page(page);
-        widget.set_size_request(content_width, (height_pt * self.zoom).round() as i32);
-        let y = offsets[page];
-        self.pages_fixed.move_(widget, 0.0, y);
+        widget.set_size_request(0, (height_pt * self.zoom).round() as i32);
         widget.set_visible(true);
         widget.queue_draw();
     }
 
-    /// Resize the scrolled content to span the full document.
-    fn update_fixed_size(&self) {
-        if self.page_sizes_pt.is_empty() {
-            return;
-        }
-        let offsets = self.offsets();
-        let height = offsets
-            .last()
-            .copied()
-            .unwrap_or(0.0)
-            + self.page_sizes_pt.last().map(|(_, h)| *h).unwrap_or(0.0) * self.zoom
-            + PAGE_SPACING as f64;
-        self.pages_fixed
-            .set_size_request(self.content_width(), height.round() as i32);
+    /// Size the top/bottom spacers so the Box's extent matches the full
+    /// document while only the visible window `first..last` is alive. Hiding
+    /// a boundary spacer (first == 0 / last == n) keeps the edge page flush
+    /// with the content border, matching the pre-virtualization Box layout.
+    fn update_spacers(&self, first: usize, last: usize, offsets: &[f64]) {
+        let n = self.page_sizes_pt.len();
+        let total = offsets[n - 1] + self.page_sizes_pt[n - 1].1 * self.zoom;
+        let top = if first > 0 {
+            (offsets[first] - PAGE_SPACING as f64).max(0.0)
+        } else {
+            0.0
+        };
+        let bottom = if last < n {
+            (total - offsets[last]).max(0.0)
+        } else {
+            0.0
+        };
+        self.top_spacer.set_size_request(0, top.round() as i32);
+        self.bottom_spacer.set_size_request(0, bottom.round() as i32);
+        self.top_spacer.set_visible(first > 0 && top > 0.0);
+        self.bottom_spacer.set_visible(last < n && bottom > 0.0);
     }
 
     fn rebuild_pages(&mut self) {
         // Tear down the previous pool and its slot bookkeeping; the pool is
         // rebuilt lazily by `layout_pages` on the next `render_visible`.
         for widget in &self.pages_pool {
-            self.pages_fixed.remove(widget);
+            self.pages_box.remove(widget);
         }
         self.pages_pool.clear();
         self.slot_page.clear();
         self.page_slot.clear();
+        self.top_spacer.set_size_request(0, 0);
+        self.bottom_spacer.set_size_request(0, 0);
         // New document: any in-flight reply targets dead indexes.
         self.invalidate_textures();
     }
@@ -749,14 +784,21 @@ impl AppModel {
         // Re-place every currently assigned pool widget at the new scale.
         // Changing the sizes nudges the scrolled content extent, which fires
         // `ViewportChanged` and drives the follow-up texture re-render.
-        let offsets = self.offsets();
-        let content_width = self.content_width();
         for (slot, page) in self.slot_page.iter().enumerate() {
             if let Some(p) = *page {
-                self.place_widget(slot, p, &offsets, content_width);
+                self.place_widget(slot, p);
             }
         }
-        self.update_fixed_size();
+        let mut first = usize::MAX;
+        let mut last = 0;
+        for p in self.slot_page.iter().flatten() {
+            first = first.min(*p);
+            last = last.max(p + 1);
+        }
+        if first < last {
+            let offsets = self.offsets();
+            self.update_spacers(first, last, &offsets);
+        }
     }
 
     /// Top-edge pixel offset of every page at the current zoom.
@@ -803,7 +845,6 @@ impl AppModel {
         }
         let (first, last) = self.visible_window();
         self.layout_pages(first, last);
-        self.update_fixed_size();
 
         let textures = self.view.textures.borrow();
         let missing: Vec<usize> = (first..last)
@@ -1237,11 +1278,22 @@ impl Component for AppModel {
             });
         let toc_widget = toc.widget().clone();
 
-        let pages_fixed = gtk::Fixed::builder().build();
+        let pages_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(PAGE_SPACING)
+            .build();
+        let top_spacer = gtk::DrawingArea::builder().hexpand(true).build();
+        let bottom_spacer = gtk::DrawingArea::builder().hexpand(true).build();
+        top_spacer.set_size_request(0, 0);
+        bottom_spacer.set_size_request(0, 0);
+        pages_box.append(&top_spacer);
+        pages_box.append(&bottom_spacer);
         let pages_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
-            .child(&pages_fixed)
+            .propagate_natural_width(false)
+            .propagate_natural_height(false)
+            .child(&pages_box)
             .build();
 
         let status_page = adw::StatusPage::builder()
@@ -1303,7 +1355,9 @@ impl Component for AppModel {
             pages_pool: Vec::new(),
             slot_page: Vec::new(),
             page_slot: HashMap::new(),
-            pages_fixed: pages_fixed.clone(),
+            pages_box: pages_box.clone(),
+            top_spacer: top_spacer.clone(),
+            bottom_spacer: bottom_spacer.clone(),
             pages_scroller: pages_scroller.clone(),
             status_page: status_page.clone(),
             title_widget: title_widget.clone(),
@@ -1459,19 +1513,17 @@ impl Component for AppModel {
         }
         adw::StyleManager::default().set_color_scheme(config.borrow().theme.into());
 
-        // Persist geometry, sidebar state, and the history when the window
-        // closes.
+        // Persist sidebar state and history when the window closes. Window
+        // geometry (width/height/maximized) is deliberately NOT saved: the
+        // size stored in config.toml is always used, so a transient window
+        // growth can never be written back over the user's configured size.
         {
             let cfg = config.clone();
             let hist = history.clone();
             let split_view = widgets.split_view.clone();
-            root.connect_close_request(move |window| {
-                let (width, height) = window.default_size();
+            root.connect_close_request(move |_window| {
                 {
                     let mut state = cfg.borrow_mut();
-                    state.window.width = width;
-                    state.window.height = height;
-                    state.window.maximized = window.is_maximized();
                     state.sidebar.width_fraction = split_view.sidebar_width_fraction();
                     state.sidebar.collapsed = split_view.is_collapsed();
                 }
@@ -1733,6 +1785,13 @@ impl Component for AppModel {
                 // is hidden instead of shown full-screen.
                 widgets.split_view.set_show_content(true);
                 widgets.split_view.set_collapsed(collapsed);
+                // Re-applying the configured fraction on re-expand restores
+                // it to the persisted value (e.g. 0.24) even if the split
+                // view drifted while collapsed.
+                if !collapsed {
+                    let frac = self.config.borrow().sidebar.width_fraction;
+                    widgets.split_view.set_sidebar_width_fraction(frac);
+                }
                 self.config.borrow_mut().sidebar.collapsed = collapsed;
                 self.persist_config();
             }
