@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use relm4::gtk;
 use relm4::gtk::gdk;
 use relm4::gtk::glib;
-use relm4::gtk::glib::object::Cast;
+use relm4::gtk::glib::object::{Cast, IsA};
 use relm4::gtk::pango::EllipsizeMode;
 use relm4::gtk::prelude::{AdjustmentExt, ListBoxRowExt, WidgetExt};
 use relm4::{Component, ComponentParts, ComponentSender};
@@ -258,9 +258,7 @@ impl TocSidebar {
         entries: &[TocEntry],
         collapsed: &[bool],
     ) {
-        let scroller = toc_list
-            .parent()
-            .and_then(|p| p.downcast::<gtk::ScrolledWindow>().ok());
+        let scroller = find_scrolled_window(toc_list);
         let saved = scroller.as_ref().map(|s| s.vadjustment().value());
         rebuild(toc_list, entries, collapsed, &mut self.rows);
         if let Some((v, s)) = saved.zip(scroller.as_ref()) {
@@ -273,7 +271,7 @@ impl TocSidebar {
         let (row, _) = &self.rows[position];
         list.select_row(Some(row));
         row.grab_focus();
-        if let Some(scroller) = list.parent().and_then(|p| p.downcast::<gtk::ScrolledWindow>().ok())
+        if let Some(scroller) = find_scrolled_window(list)
         {
             let y = row
                 .compute_point(list, &gtk::graphene::Point::new(0.0, 0.0))
@@ -294,6 +292,20 @@ impl TocSidebar {
             adjustment.set_value(value.clamp(adjustment.lower(), max));
         }
     }
+}
+
+/// The `ScrolledWindow` containing `widget`, walking up the parent chain.
+/// The `ListBox` lives inside the scroller's internal `GtkViewport`, so it is
+/// not the direct parent and a single `parent()` lookup misses it.
+fn find_scrolled_window(widget: &impl IsA<gtk::Widget>) -> Option<gtk::ScrolledWindow> {
+    let mut current = widget.clone().upcast::<gtk::Widget>().parent();
+    while let Some(w) = current {
+        if let Ok(sw) = w.clone().downcast::<gtk::ScrolledWindow>() {
+            return Some(sw);
+        }
+        current = w.parent();
+    }
+    None
 }
 
 /// Whether the entry has any children in the outline walk.
