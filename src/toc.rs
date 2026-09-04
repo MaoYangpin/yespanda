@@ -197,7 +197,10 @@ impl Component for TocSidebar {
                 if let Some(entry_index) = self.current_entry(&widgets.toc_list) {
                     if has_children(&self.entries, entry_index) {
                         self.collapsed[entry_index] = !self.collapsed[entry_index];
-                        rebuild(&widgets.toc_list, &self.entries, &self.collapsed, &mut self.rows);
+                        let entries = self.entries.clone();
+                        let collapsed = self.collapsed.clone();
+                        self.rebuild_preserve(
+                            &widgets.toc_list, &entries, &collapsed);
                         if let Some(position) = self
                             .rows
                             .iter()
@@ -214,7 +217,10 @@ impl Component for TocSidebar {
                 if let Some(entry_index) = self.current_entry(&widgets.toc_list)
                     && has_children(&self.entries, entry_index) && !self.collapsed[entry_index] {
                         self.collapsed[entry_index] = true;
-                        rebuild(&widgets.toc_list, &self.entries, &self.collapsed, &mut self.rows);
+                        let entries = self.entries.clone();
+                        let collapsed = self.collapsed.clone();
+                        self.rebuild_preserve(
+                            &widgets.toc_list, &entries, &collapsed);
                         if let Some(position) = self
                             .rows
                             .iter()
@@ -241,6 +247,25 @@ impl TocSidebar {
             .selected_row()
             .map(|row| row.index().max(0) as usize)?;
         self.rows.get(position).map(|(_, entry_index)| *entry_index)
+    }
+
+    /// Rebuild visible rows while preserving the scrolled window's
+    /// scroll position, so expanding/collapsing an entry does not
+    /// snap the view back to the top of the TOC.
+    fn rebuild_preserve(
+        &mut self,
+        toc_list: &gtk::ListBox,
+        entries: &[TocEntry],
+        collapsed: &[bool],
+    ) {
+        let scroller = toc_list
+            .parent()
+            .and_then(|p| p.downcast::<gtk::ScrolledWindow>().ok());
+        let saved = scroller.as_ref().map(|s| s.vadjustment().value());
+        rebuild(toc_list, entries, collapsed, &mut self.rows);
+        if let Some((v, s)) = saved.zip(scroller.as_ref()) {
+            s.vadjustment().set_value(v);
+        }
     }
 
     /// Select `position`, focus its row, and scroll it into view.
