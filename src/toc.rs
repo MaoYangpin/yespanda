@@ -160,13 +160,21 @@ impl Component for TocSidebar {
                 // next to the position tracking. Clear it whenever the
                 // position highlight moves so only `toc-active` shows.
                 widgets.toc_list.unselect_all();
+                let mut active_row = None;
                 for (row, entry_index) in &self.rows {
                     let active = Some(*entry_index) == index;
                     if active {
                         row.add_css_class("toc-active");
+                        active_row = Some(row);
                     } else {
                         row.remove_css_class("toc-active");
                     }
+                }
+                // Keep the current section visible while reading: if its row
+                // has scrolled out of the sidebar's viewport, bring it back
+                // into the middle (or to the edge near the list's ends).
+                if let Some(row) = active_row {
+                    self.reveal_row(&widgets.toc_list, row);
                 }
             }
             TocInput::Focus(target) => {
@@ -301,6 +309,33 @@ impl TocSidebar {
             let max = (adjustment.upper() - view).max(adjustment.lower());
             adjustment.set_value(value.clamp(adjustment.lower(), max));
         }
+    }
+
+    /// If `row` is not fully visible in the sidebar, scroll it into the
+    /// middle of the viewport. Rows near the very start/end of the list are
+    /// clamped so they sit at the top/bottom edge instead.
+    fn reveal_row(&self, list: &gtk::ListBox, row: &gtk::ListBoxRow) {
+        let Some(scroller) = find_scrolled_window(list) else {
+            return;
+        };
+        let adjustment = scroller.vadjustment();
+        let y = row
+            .compute_point(list, &gtk::graphene::Point::new(0.0, 0.0))
+            .map(|p| p.y() as f64)
+            .unwrap_or(0.0);
+        let top = y.max(0.0);
+        let bottom = top + row.height() as f64;
+        let value = adjustment.value();
+        let view = adjustment.page_size();
+        // Fully visible: leave it alone so the highlight doesn't jump while it
+        // is merely moving among rows that are already on screen.
+        if top >= value && bottom <= value + view {
+            return;
+        }
+        // Centre the row in the viewport, clamped to the scrollable range.
+        let target = top - (view - row.height() as f64) / 2.0;
+        let max = (adjustment.upper() - view).max(adjustment.lower());
+        adjustment.set_value(target.clamp(adjustment.lower(), max));
     }
 }
 
