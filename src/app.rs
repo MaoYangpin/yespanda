@@ -907,6 +907,23 @@ impl AppModel {
         if self.fit_mode && self.last_viewport_width == 0 {
             return;
         }
+        let offsets = self.offsets();
+        if offsets.get(page).is_none() {
+            self.pending_restore = None;
+            return;
+        }
+        // Right after opening, the scrolled content has not been laid out
+        // tall enough yet: the vertical adjustment's upper still equals the
+        // viewport, so any scroll target clamps to the top and the saved
+        // position would be silently lost (and then overwritten with page 0).
+        // Wait until the layout has grown the content to its full extent,
+        // then restore on a later ViewportChanged pass.
+        let adjustment = self.pages_scroller.vadjustment();
+        let n = self.page_sizes_pt.len();
+        let expected_total = offsets[n - 1] + self.page_sizes_pt[n - 1].1 * self.zoom;
+        if adjustment.upper() < expected_total - 1.0 {
+            return;
+        }
         self.pending_restore = None;
         if let Some(path) = self.path.clone() {
             self.history.borrow_mut().set(&path, page);
