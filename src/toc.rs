@@ -195,8 +195,11 @@ impl Component for TocSidebar {
             }
             TocInput::Activate => {
                 if let Some(entry_index) = self.current_entry(&widgets.toc_list) {
-                    if has_children(&self.entries, entry_index) {
-                        self.collapsed[entry_index] = !self.collapsed[entry_index];
+                    let has_kids = has_children(&self.entries, entry_index);
+                    if has_kids && self.collapsed[entry_index] {
+                        // "l" expands a collapsed entry with children; it
+                        // never collapses (use "h" for that).
+                        self.collapsed[entry_index] = false;
                         let entries = self.entries.clone();
                         let collapsed = self.collapsed.clone();
                         self.rebuild_preserve(
@@ -209,6 +212,7 @@ impl Component for TocSidebar {
                             self.select_row(&widgets.toc_list, position);
                         }
                     } else {
+                        // A leaf or an already-expanded entry: open it.
                         let _ = sender.output(TocOutput::GoTo(entry_index));
                     }
                 }
@@ -261,8 +265,14 @@ impl TocSidebar {
         let scroller = find_scrolled_window(toc_list);
         let saved = scroller.as_ref().map(|s| s.vadjustment().value());
         rebuild(toc_list, entries, collapsed, &mut self.rows);
-        if let Some((v, s)) = saved.zip(scroller.as_ref()) {
-            s.vadjustment().set_value(v);
+        // Restoring in an idle lets the layout pass triggered by removing and
+        // re-adding the rows settle first; a synchronous set_value right here
+        // gets clobbered by that re-layout and the view snaps to the top.
+        if let Some((v, s)) = saved.zip(scroller) {
+            glib::idle_add_local(move || {
+                s.vadjustment().set_value(v);
+                glib::ControlFlow::Break
+            });
         }
     }
 
