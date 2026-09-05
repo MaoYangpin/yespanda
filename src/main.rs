@@ -13,7 +13,10 @@ use relm4::{MessageBroker, RelmApp};
 use crate::app::{AppModel, AppMsg};
 use crate::config::Config;
 
-pub const APP_ID: &str = "Yespanda";
+// Must be a valid reverse-DNS id: GApplication enforces single-instance by
+// owning this id on the session bus, which only works if it is a valid D-Bus
+// well-known name (dot-separated). The on-screen name stays "Yespanda".
+pub const APP_ID: &str = "org.yespanda.Yespanda";
 
 pub(crate) static APP_BROKER: MessageBroker<AppMsg> = MessageBroker::new();
 
