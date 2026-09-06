@@ -113,25 +113,33 @@ impl Component for TocSidebar {
             let b = bindings;
             key_controller.connect_key_pressed(move |_, keyval, _, state| {
                 if let Some((modifiers, key)) = b.down
-                    && state == modifiers && keyval == key {
-                        input.input(TocInput::MoveCursor(1));
-                        return glib::Propagation::Stop;
-                    }
+                    && state == modifiers
+                    && keyval == key
+                {
+                    input.input(TocInput::MoveCursor(1));
+                    return glib::Propagation::Stop;
+                }
                 if let Some((modifiers, key)) = b.up
-                    && state == modifiers && keyval == key {
-                        input.input(TocInput::MoveCursor(-1));
-                        return glib::Propagation::Stop;
-                    }
+                    && state == modifiers
+                    && keyval == key
+                {
+                    input.input(TocInput::MoveCursor(-1));
+                    return glib::Propagation::Stop;
+                }
                 if let Some((modifiers, key)) = b.activate
-                    && state == modifiers && keyval == key {
-                        input.input(TocInput::Activate);
-                        return glib::Propagation::Stop;
-                    }
+                    && state == modifiers
+                    && keyval == key
+                {
+                    input.input(TocInput::Activate);
+                    return glib::Propagation::Stop;
+                }
                 if let Some((modifiers, key)) = b.collapse
-                    && state == modifiers && keyval == key {
-                        input.input(TocInput::Collapse);
-                        return glib::Propagation::Stop;
-                    }
+                    && state == modifiers
+                    && keyval == key
+                {
+                    input.input(TocInput::Collapse);
+                    return glib::Propagation::Stop;
+                }
                 glib::Propagation::Proceed
             });
         }
@@ -152,7 +160,12 @@ impl Component for TocSidebar {
             TocInput::Set(entries) => {
                 self.entries = entries;
                 self.collapsed = vec![false; self.entries.len()];
-                rebuild(&widgets.toc_list, &self.entries, &self.collapsed, &mut self.rows);
+                rebuild(
+                    &widgets.toc_list,
+                    &self.entries,
+                    &self.collapsed,
+                    &mut self.rows,
+                );
             }
             TocInput::Highlight(index) => {
                 // A row clicked for navigation stays selected with an accent
@@ -183,7 +196,9 @@ impl Component for TocSidebar {
                 }
                 let position = target
                     .and_then(|entry| {
-                        self.rows.iter().position(|(_, entry_index)| *entry_index == entry)
+                        self.rows
+                            .iter()
+                            .position(|(_, entry_index)| *entry_index == entry)
                     })
                     .unwrap_or(0);
                 self.select_row(&widgets.toc_list, position);
@@ -197,8 +212,8 @@ impl Component for TocSidebar {
                     .selected_row()
                     .map(|row| row.index().max(0) as usize)
                     .unwrap_or(0);
-                let target = (current as isize + delta)
-                    .clamp(0, self.rows.len() as isize - 1) as usize;
+                let target =
+                    (current as isize + delta).clamp(0, self.rows.len() as isize - 1) as usize;
                 self.select_row(&widgets.toc_list, target);
             }
             TocInput::Activate => {
@@ -210,12 +225,9 @@ impl Component for TocSidebar {
                         self.collapsed[entry_index] = false;
                         let entries = self.entries.clone();
                         let collapsed = self.collapsed.clone();
-                        self.rebuild_preserve(
-                            &widgets.toc_list, &entries, &collapsed);
-                        if let Some(position) = self
-                            .rows
-                            .iter()
-                            .position(|(_, idx)| *idx == entry_index)
+                        self.rebuild_preserve(&widgets.toc_list, &entries, &collapsed);
+                        if let Some(position) =
+                            self.rows.iter().position(|(_, idx)| *idx == entry_index)
                         {
                             self.select_row(&widgets.toc_list, position);
                         }
@@ -227,20 +239,19 @@ impl Component for TocSidebar {
             }
             TocInput::Collapse => {
                 if let Some(entry_index) = self.current_entry(&widgets.toc_list)
-                    && has_children(&self.entries, entry_index) && !self.collapsed[entry_index] {
-                        self.collapsed[entry_index] = true;
-                        let entries = self.entries.clone();
-                        let collapsed = self.collapsed.clone();
-                        self.rebuild_preserve(
-                            &widgets.toc_list, &entries, &collapsed);
-                        if let Some(position) = self
-                            .rows
-                            .iter()
-                            .position(|(_, idx)| *idx == entry_index)
-                        {
-                            self.select_row(&widgets.toc_list, position);
-                        }
+                    && has_children(&self.entries, entry_index)
+                    && !self.collapsed[entry_index]
+                {
+                    self.collapsed[entry_index] = true;
+                    let entries = self.entries.clone();
+                    let collapsed = self.collapsed.clone();
+                    self.rebuild_preserve(&widgets.toc_list, &entries, &collapsed);
+                    if let Some(position) =
+                        self.rows.iter().position(|(_, idx)| *idx == entry_index)
+                    {
+                        self.select_row(&widgets.toc_list, position);
                     }
+                }
             }
             TocInput::OpenAt(position) => {
                 if let Some((_, entry_index)) = self.rows.get(position) {
@@ -255,9 +266,7 @@ impl Component for TocSidebar {
 impl TocSidebar {
     /// Entry index under the keyboard cursor (visible selection).
     fn current_entry(&self, list: &gtk::ListBox) -> Option<usize> {
-        let position = list
-            .selected_row()
-            .map(|row| row.index().max(0) as usize)?;
+        let position = list.selected_row().map(|row| row.index().max(0) as usize)?;
         self.rows.get(position).map(|(_, entry_index)| *entry_index)
     }
 
@@ -289,8 +298,7 @@ impl TocSidebar {
         let (row, _) = &self.rows[position];
         list.select_row(Some(row));
         row.grab_focus();
-        if let Some(scroller) = find_scrolled_window(list)
-        {
+        if let Some(scroller) = find_scrolled_window(list) {
             let y = row
                 .compute_point(list, &gtk::graphene::Point::new(0.0, 0.0))
                 .map(|p| p.y() as f64)
@@ -375,7 +383,10 @@ fn visible_indices(entries: &[TocEntry], collapsed: &[bool]) -> Vec<usize> {
     let mut path: Vec<usize> = Vec::new();
     let mut visible = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        while path.last().is_some_and(|&ancestor| entries[ancestor].depth >= entry.depth) {
+        while path
+            .last()
+            .is_some_and(|&ancestor| entries[ancestor].depth >= entry.depth)
+        {
             path.pop();
         }
         let shown = path.last().is_none_or(|&ancestor| !collapsed[ancestor]);

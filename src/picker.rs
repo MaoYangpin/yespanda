@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use adw::prelude::*;
 use relm4::gtk;
 use relm4::gtk::gdk;
 use relm4::gtk::glib;
-use relm4::gtk::prelude::*;
 use relm4::gtk::prelude::AdjustmentExt;
-use adw::prelude::*;
-use relm4::{adw, Component, ComponentParts, ComponentSender};
+use relm4::gtk::prelude::*;
+use relm4::{Component, ComponentParts, ComponentSender, adw};
 
 const FILTER_DEBOUNCE_MS: u32 = 150;
 const MAX_EMPTY_RESULTS: usize = 50;
@@ -163,7 +163,9 @@ impl Component for PickerDialog {
             .title("No matching files")
             .description("Try a different search term.")
             .build();
-        widgets.results_stack.add_named(&results_list, Some("results"));
+        widgets
+            .results_stack
+            .add_named(&results_list, Some("results"));
         widgets.results_stack.add_named(&empty_page, Some("empty"));
         widgets.results_stack.set_visible_child_name("empty");
 
@@ -211,11 +213,15 @@ impl Component for PickerDialog {
                 // AdwActionRow consumes Enter/space for its own activation
                 // before GtkListBox can emit row-activated, so open the
                 // selected row here instead.
-                if matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space)
-                    && !entry.has_focus()
+                if matches!(
+                    keyval,
+                    gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space
+                ) && !entry.has_focus()
                     && let Some(row) = list.selected_row()
                 {
-                    forward.send(PickerMsg::Confirm(row.index().max(0) as usize)).ok();
+                    forward
+                        .send(PickerMsg::Confirm(row.index().max(0) as usize))
+                        .ok();
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
@@ -310,21 +316,23 @@ impl Component for PickerDialog {
             }
             PickerMsg::Confirm(index) => {
                 if !self.done
-                    && let Some(path) = self.results.get(index) {
-                        self.done = true;
-                        let _ = sender.output(PickerOutput::Pick(PathBuf::from(path)));
-                        root.close();
-                    }
+                    && let Some(path) = self.results.get(index)
+                {
+                    self.done = true;
+                    let _ = sender.output(PickerOutput::Pick(PathBuf::from(path)));
+                    root.close();
+                }
             }
             PickerMsg::ConfirmCurrent => {
                 if let Some(row) = self.results_list.selected_row() {
                     let index = row.index().max(0) as usize;
                     if !self.done
-                        && let Some(path) = self.results.get(index) {
-                            self.done = true;
-                            let _ = sender.output(PickerOutput::Pick(PathBuf::from(path)));
-                            root.close();
-                        }
+                        && let Some(path) = self.results.get(index)
+                    {
+                        self.done = true;
+                        let _ = sender.output(PickerOutput::Pick(PathBuf::from(path)));
+                        root.close();
+                    }
                 }
             }
             PickerMsg::Closed => {
@@ -406,11 +414,12 @@ fn move_selection(
     match current {
         None => {
             if delta > 0
-                && let Some(row) = list.row_at_index(0) {
-                    list.select_row(Some(&row));
-                    row.grab_focus();
-                    scroll_row_into_view(scroller, list, &row);
-                }
+                && let Some(row) = list.row_at_index(0)
+            {
+                list.select_row(Some(&row));
+                row.grab_focus();
+                scroll_row_into_view(scroller, list, &row);
+            }
         }
         Some(index) => {
             let target = index as isize + delta;
@@ -493,11 +502,13 @@ fn rebuild_list(list: &gtk::ListBox, results: &[String]) {
 
 /// Show the empty-state page when a filter yields nothing.
 fn update_stack_page(widgets: &PickerDialogWidgets, result_count: usize) {
-    widgets.results_stack.set_visible_child_name(if result_count == 0 {
-        "empty"
-    } else {
-        "results"
-    });
+    widgets
+        .results_stack
+        .set_visible_child_name(if result_count == 0 {
+            "empty"
+        } else {
+            "results"
+        });
 }
 
 #[cfg(test)]
@@ -549,13 +560,22 @@ mod tests {
             return;
         }
         let candidates = list_candidates("/tmp/opencode");
-        assert!(!candidates.is_empty(), "fd should find PDFs in /tmp/opencode");
+        assert!(
+            !candidates.is_empty(),
+            "fd should find PDFs in /tmp/opencode"
+        );
         assert!(candidates.iter().any(|p| p.contains("real.pdf")));
 
         let matches = filter(&candidates, "real");
         assert!(matches.iter().any(|p| p.contains("real.pdf")));
 
         let limited = filter(&candidates, "");
-        assert_eq!(limited, candidates.into_iter().take(MAX_EMPTY_RESULTS).collect::<Vec<_>>());
+        assert_eq!(
+            limited,
+            candidates
+                .into_iter()
+                .take(MAX_EMPTY_RESULTS)
+                .collect::<Vec<_>>()
+        );
     }
 }

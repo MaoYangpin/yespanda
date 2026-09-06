@@ -1,6 +1,6 @@
 use adw::prelude::*;
 use gtk::glib;
-use relm4::{adw, gtk, Component, ComponentParts, ComponentSender};
+use relm4::{Component, ComponentParts, ComponentSender, adw, gtk};
 
 // ---- list ---------------------------------------------------------------
 
@@ -175,7 +175,6 @@ impl Component for NotesList {
         // holds keyboard focus inside the sheet.
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         root.add_controller(keys);
-
 
         ComponentParts { model, widgets }
     }

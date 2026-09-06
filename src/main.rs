@@ -6,8 +6,11 @@ mod pdf;
 mod picker;
 mod toc;
 
+use relm4::gtk::gio::{
+    self,
+    prelude::{ApplicationExt, ApplicationExtManual, FileExt},
+};
 use relm4::gtk::glib;
-use relm4::gtk::gio::{self, prelude::{ApplicationExt, ApplicationExtManual, FileExt}};
 use relm4::{MessageBroker, RelmApp};
 
 use crate::app::{AppModel, AppMsg};

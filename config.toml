@@ -1,0 +1,40 @@
+fit_width = true
+theme = "system"
+
+[window]
+width = 1920
+height = 1080
+maximized = false
+
+[sidebar]
+width_fraction = 0.24
+collapsed = false
+
+[keymap]
+scroll_down = "j"
+scroll_up = "k"
+scroll_left = "h"
+scroll_right = "l"
+scroll_top = "g g"
+scroll_bottom = "shift G"
+search = "slash"
+search_next = "n"
+search_prev = "shift N"
+note_add = "m"
+note_list = "shift M"
+sidebar_toggle = "space e"
+sidebar_down = "j"
+sidebar_up = "k"
+sidebar_activate = "l"
+sidebar_collapse = "h"
+focus_sidebar = "ctrl h"
+focus_pdf = "ctrl l"
+zoom_in = "ctrl plus"
+zoom_out = "ctrl minus"
+pick_file = "ctrl o"
+pick_file_chord = "space space"
+
+[picker]
+root = "~/Books/"
+width = 920
+height = 520

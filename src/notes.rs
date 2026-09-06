@@ -63,8 +63,7 @@ impl Notes {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
         let raw = toml::to_string_pretty(self)?;
-        std::fs::write(dir.join("notes.toml"), raw)
-            .context("failed to write notes.toml")
+        std::fs::write(dir.join("notes.toml"), raw).context("failed to write notes.toml")
     }
 
     /// Append a note and return its id.
@@ -110,15 +109,15 @@ impl Notes {
 
     /// Notes of one document, reading order (page, then top-to-bottom).
     pub fn for_doc(&self, doc: &Path) -> Vec<&Note> {
-        let mut found: Vec<&Note> = self
-            .notes
-            .iter()
-            .filter(|note| note.doc == doc)
-            .collect();
+        let mut found: Vec<&Note> = self.notes.iter().filter(|note| note.doc == doc).collect();
         found.sort_by(|a, b| {
             a.page
                 .cmp(&b.page)
-                .then(a.y_frac.partial_cmp(&b.y_frac).unwrap_or(std::cmp::Ordering::Equal))
+                .then(
+                    a.y_frac
+                        .partial_cmp(&b.y_frac)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
                 .then(a.id.cmp(&b.id))
         });
         found

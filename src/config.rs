@@ -353,9 +353,10 @@ impl History {
             for line in raw.lines() {
                 // Split at the last tab so paths may contain tabs themselves.
                 if let Some((path, page)) = line.rsplit_once('\t')
-                    && let Ok(page) = page.trim().parse::<usize>() {
-                        entries.push((PathBuf::from(path), page));
-                    }
+                    && let Ok(page) = page.trim().parse::<usize>()
+                {
+                    entries.push((PathBuf::from(path), page));
+                }
             }
         }
         Self { entries }
@@ -395,8 +396,7 @@ impl History {
             raw.push_str(&page.to_string());
             raw.push('\n');
         }
-        std::fs::write(&path, raw)
-            .with_context(|| format!("failed to write {}", path.display()))
+        std::fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
     }
 }
 

@@ -6,7 +6,7 @@ use cairo::{Context as CairoContext, Format, ImageSurface};
 use poppler::{
     Document, FindFlags,
     ffi::{
-        PopplerIndexIter, POPPLER_ACTION_GOTO_DEST, POPPLER_ACTION_NAMED, poppler_action_free,
+        POPPLER_ACTION_GOTO_DEST, POPPLER_ACTION_NAMED, PopplerIndexIter, poppler_action_free,
         poppler_dest_free, poppler_index_iter_free, poppler_index_iter_get_action,
         poppler_index_iter_get_child, poppler_index_iter_new, poppler_index_iter_next,
     },
@@ -81,7 +81,12 @@ impl PdfDoc {
         }
     }
 
-    unsafe fn walk_toc(&self, iter: *mut PopplerIndexIter, depth: usize, entries: &mut Vec<TocEntry>) {
+    unsafe fn walk_toc(
+        &self,
+        iter: *mut PopplerIndexIter,
+        depth: usize,
+        entries: &mut Vec<TocEntry>,
+    ) {
         loop {
             unsafe {
                 let action = poppler_index_iter_get_action(iter);
@@ -112,14 +117,16 @@ impl PdfDoc {
                                 }
                             }
                         }
-                        POPPLER_ACTION_NAMED => {
-                            self.resolve_named_dest((*action).named.named_dest)
-                        }
+                        POPPLER_ACTION_NAMED => self.resolve_named_dest((*action).named.named_dest),
                         _ => None,
                     };
                     poppler_action_free(action);
 
-                    entries.push(TocEntry { title, page: page.unwrap_or(0), depth });
+                    entries.push(TocEntry {
+                        title,
+                        page: page.unwrap_or(0),
+                        depth,
+                    });
                 }
 
                 // Note: walk_toc takes ownership and frees the child iterator.
@@ -248,8 +255,10 @@ mod tests {
         let toc = doc.toc();
         assert_eq!(toc.len(), 154);
 
-        let summary: Vec<_> =
-            toc.iter().map(|e| (e.title.as_str(), e.page, e.depth)).collect();
+        let summary: Vec<_> = toc
+            .iter()
+            .map(|e| (e.title.as_str(), e.page, e.depth))
+            .collect();
         assert_eq!(summary[0], ("Contents", 1, 0));
         assert_eq!(summary[1], ("Preface", 7, 0));
         assert_eq!(summary[2], ("Overview of this Book", 9, 0));
@@ -323,7 +332,10 @@ mod tests {
         // down that y grows downward from the top-left corner (a
         // bottom-left origin would return ~742 for this rect instead).
         let top = matches[0];
-        assert!(top.y < 200.0, "first match should be near the top, got {top:?}");
+        assert!(
+            top.y < 200.0,
+            "first match should be near the top, got {top:?}"
+        );
         assert!((top.x - 72.0).abs() < 5.0, "x starts at the pen position");
         let bottom = matches[1];
         assert!(bottom.y > 700.0, "second match should be near the bottom");
